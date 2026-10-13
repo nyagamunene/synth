@@ -942,6 +942,13 @@ fn build_net_settings<'a>(
                 .unwrap_or_else(|| synth_layout::netclass::net_class_color(&nc.name))
         });
     }
+    // A class the author gave no clearance falls back to the manufacturer
+    // minimum the router works to. KiCad checks the larger clearance of the
+    // two classes involved, so KiCad's own 0.2 mm default would flag copper
+    // the router placed legally.
+    let default_clearance = synth_geometry::nm_to_mm(
+        synth_drc::ManufacturerProfile::jlc_standard().min_copper_clearance_nm,
+    );
     // Declared width/clearance per class, where the author set them.
     let mut rules: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
     for nc in &board.netclasses {
@@ -949,7 +956,8 @@ fn build_net_settings<'a>(
             nc.name.as_str(),
             (
                 nc.trace_width.map_or(0.2, synth_ir::Length::to_mm),
-                nc.clearance.map_or(0.2, synth_ir::Length::to_mm),
+                nc.clearance
+                    .map_or(default_clearance, synth_ir::Length::to_mm),
             ),
         );
     }
@@ -972,7 +980,10 @@ fn build_net_settings<'a>(
             .get(name)
             .copied()
             .unwrap_or_else(|| synth_layout::netclass::net_class_color(name));
-        let (track_width, clearance) = rules.get(name.as_str()).copied().unwrap_or((0.2, 0.2));
+        let (track_width, clearance) = rules
+            .get(name.as_str())
+            .copied()
+            .unwrap_or((0.2, default_clearance));
         let (pair_width, pair_gap) = pairs.get(name.as_str()).copied().unwrap_or((0.2, 0.25));
         // KiCad gives Default the max priority so it always loses to a
         // specific class; specific classes count up from 0.
@@ -1196,5 +1207,32 @@ mod tests {
         // Declared width/clearance flow through.
         assert_eq!(pwr["track_width"], 0.5);
         assert_eq!(pwr["clearance"], 0.2);
+    }
+
+    /// A class with no declared clearance gets the manufacturer minimum the
+    /// router and the DRC profile use, not KiCad's 0.2 mm default: KiCad
+    /// checks the larger class clearance, so 0.2 mm flags copper the router
+    /// legally placed 0.127 mm apart.
+    #[test]
+    fn classes_without_a_declared_clearance_use_the_manufacturer_minimum() {
+        let board = board_from(
+            r#"board "b" {
+                netclass "FAST" { trace_width 0.3mm }
+                component U1: regulator "ams1117_3v3"
+                component C1: capacitor "c_generic_0805" value "10uF"
+                connect U1.vout -> C1.p1
+                connect U1.gnd -> C1.p2
+            }"#,
+        );
+        let settings = build_net_settings(&board, std::iter::once(&synth_layout::layout(&board)));
+        let minimum = 0.127;
+        for class in settings["classes"].as_array().unwrap() {
+            assert_eq!(
+                class["clearance"].as_f64().unwrap(),
+                minimum,
+                "class {} must not exceed the {minimum} mm the router uses",
+                class["name"]
+            );
+        }
     }
 }
