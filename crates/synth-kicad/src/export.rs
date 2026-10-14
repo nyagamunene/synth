@@ -359,7 +359,10 @@ fn export_inner(
     let project_text = serde_json::to_string_pretty(&project_doc)
         .map_err(|source| ExportError::SerializeProject { source })?;
     write_file(&project_path, &project_text)?;
-    write_file(&out_dir.join(format!("{stem}.kicad_dru")), design_rules())?;
+    write_file(
+        &out_dir.join(format!("{stem}.kicad_dru")),
+        &design_rules(&manufacturer_profile(board)),
+    )?;
 
     // Library file (.kicad_sym): self-contained symbol library
     // covering every part referenced by the IR plus the
@@ -911,15 +914,27 @@ fn placement_score(board: &Board, placement: &synth_place::Placement) -> usize {
     .len()
 }
 
-/// The project's custom DRC rules (`<board>.kicad_dru`). KiCad checks copper
-/// against the board edge and against holes with rules that default to 0.5 mm
-/// and 0.25 mm, and `kicad-cli` does not read them from the project file, so
-/// the manufacturer's 0.2 mm (JLCPCB: copper to a routed edge, NPTH and via
-/// hole to track) goes in as custom rules.
-fn design_rules() -> &'static str {
-    "(version 1)\n\
-     (rule \"manufacturer copper to edge\"\n  (constraint edge_clearance (min 0.2mm)))\n\
-     (rule \"manufacturer copper to hole\"\n  (constraint hole_clearance (min 0.2mm)))\n"
+/// The profile of the manufacturer the board declares, resolved as the router
+/// resolves it, so the exported rules and the router work to the same numbers.
+fn manufacturer_profile(board: &Board) -> synth_drc::ManufacturerProfile {
+    synth_drc::ManufacturerProfile::from_name(board.manufacturer.as_deref().unwrap_or_default())
+}
+
+/// The project's custom DRC rules (`<board>.kicad_dru`), from the board's
+/// manufacturer profile. KiCad checks copper against the board edge and
+/// against holes with rules that default to 0.5 mm and 0.25 mm, and
+/// `kicad-cli` does not read them from the project file. An NPTH hole is an
+/// edge to KiCad, so it gets its own rule at the hole-to-copper figure; KiCad
+/// applies the last matching rule, so it comes after the general one.
+fn design_rules(profile: &synth_drc::ManufacturerProfile) -> String {
+    let edge = synth_geometry::nm_to_mm(profile.min_copper_to_edge_nm);
+    let hole = synth_geometry::nm_to_mm(profile.min_drill_to_copper_nm);
+    format!(
+        "(version 1)\n\
+         (rule \"manufacturer copper to board edge\"\n  (constraint edge_clearance (min {edge}mm)))\n\
+         (rule \"manufacturer copper to NPTH hole\"\n  (constraint edge_clearance (min {hole}mm))\n  (condition \"A.Pad_Type == 'NPTH, mechanical'\"))\n\
+         (rule \"manufacturer copper to hole\"\n  (constraint hole_clearance (min {hole}mm)))\n"
+    )
 }
 
 /// Build the `.kicad_pro` `net_settings` block (schematic-quality
@@ -958,9 +973,8 @@ fn build_net_settings<'a>(
     // minimum the router works to. KiCad checks the larger clearance of the
     // two classes involved, so KiCad's own 0.2 mm default would flag copper
     // the router placed legally.
-    let default_clearance = synth_geometry::nm_to_mm(
-        synth_drc::ManufacturerProfile::jlc_standard().min_copper_clearance_nm,
-    );
+    let default_clearance =
+        synth_geometry::nm_to_mm(manufacturer_profile(board).min_copper_clearance_nm);
     // Declared width/clearance per class, where the author set them.
     let mut rules: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
     for nc in &board.netclasses {
@@ -1221,17 +1235,51 @@ mod tests {
         assert_eq!(pwr["clearance"], 0.2);
     }
 
-    /// KiCad measures copper against the board edge and against NPTH holes with
-    /// one rule that defaults to 0.5 mm, and `kicad-cli` does not read it from
-    /// the project file: it takes a custom rule. JLCPCB's stated minimum for
-    /// both is 0.2 mm.
+    /// KiCad checks copper against the board edge and against holes with rules
+    /// that default to 0.5 mm and 0.25 mm, and `kicad-cli` does not read them
+    /// from the project file: they go in as custom rules, from the profile the
+    /// board's manufacturer resolves to. An NPTH hole is an edge to KiCad, so it
+    /// gets its own rule at the profile's hole-to-copper figure.
     #[test]
-    fn custom_rules_carry_the_manufacturer_edge_and_hole_clearance() {
-        for constraint in [
-            "(constraint edge_clearance (min 0.2mm))",
-            "(constraint hole_clearance (min 0.2mm))",
+    fn custom_rules_come_from_the_profile_not_from_literals() {
+        let profile = synth_drc::ManufacturerProfile::from_toml_str(
+            "name = \"t\"\nmin_trace_width_mm = 0.11\nmin_copper_clearance_mm = 0.12\n\
+             min_copper_to_edge_mm = 0.77\nmin_drill_diameter_mm = 0.3\n\
+             min_annular_ring_mm = 0.13\nmin_drill_to_copper_mm = 0.33\n",
+        )
+        .unwrap();
+        let rules = design_rules(&profile);
+        for expected in [
+            "(constraint edge_clearance (min 0.77mm))",
+            "(constraint hole_clearance (min 0.33mm))",
+            "(constraint edge_clearance (min 0.33mm))\n  (condition \"A.Pad_Type == 'NPTH, mechanical'\")",
         ] {
-            assert!(design_rules().contains(constraint), "{}", design_rules());
+            assert!(rules.contains(expected), "{expected}\n{rules}");
+        }
+    }
+
+    /// The router resolves the board's declared manufacturer, so the exported
+    /// clearances must too: an OSH Park board is routed to 0.125 mm, and a class
+    /// exported at the JLCPCB 0.127 mm would be tighter than the router worked to.
+    #[test]
+    fn class_clearance_follows_the_boards_manufacturer() {
+        let board = board_from(
+            r#"board "b" {
+                manufacturer "oshpark"
+                component U1: regulator "ams1117_3v3"
+                component C1: capacitor "c_generic_0805" value "10uF"
+                connect U1.vout -> C1.p1
+                connect U1.gnd -> C1.p2
+            }"#,
+        );
+        let settings = build_net_settings(&board, std::iter::once(&synth_layout::layout(&board)));
+        for class in settings["classes"].as_array().unwrap() {
+            assert_eq!(
+                class["clearance"].as_f64().unwrap(),
+                0.125,
+                "{}",
+                class["name"]
+            );
         }
     }
 
