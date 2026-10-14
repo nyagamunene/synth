@@ -14,7 +14,7 @@
 //! could not check" and "we checked and found nothing" must never look
 //! the same to the release gate.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -169,7 +169,12 @@ pub fn run_detailed(board_path: &Path, request: &RouteRequest) -> DrcReport {
         board_path.display().to_string(),
     ];
 
-    let invocation = match crate::process::run(Path::new(&cli), &args, DRC_BUDGET, DRC_OUTPUT_CAP) {
+    let staged = stage_project_files(&request.out_dir, &request.stem, board_path);
+    let result = crate::process::run(Path::new(&cli), &args, DRC_BUDGET, DRC_OUTPUT_CAP);
+    for file in staged {
+        let _ = std::fs::remove_file(file);
+    }
+    let invocation = match result {
         Ok(invocation) => invocation,
         Err(error) => {
             return DrcReport {
@@ -200,6 +205,25 @@ pub fn run_detailed(board_path: &Path, request: &RouteRequest) -> DrcReport {
         )),
         ..DrcReport::default()
     })
+}
+
+/// Copy the export's project file and custom rules next to `board_path`.
+///
+/// `kicad-cli` reads both from files that share the board's name, and the
+/// routed candidate is named differently from the export, so without this the
+/// DRC runs on KiCad's own defaults, not the rules the export wrote. A file
+/// already beside the board is left alone. Returns the files this call made,
+/// for the caller to remove.
+fn stage_project_files(export_dir: &Path, export_stem: &str, board_path: &Path) -> Vec<PathBuf> {
+    ["kicad_pro", "kicad_dru"]
+        .into_iter()
+        .filter_map(|extension| {
+            let source = export_dir.join(format!("{export_stem}.{extension}"));
+            let staged = board_path.with_extension(extension);
+            (source.is_file() && !staged.exists() && std::fs::copy(&source, &staged).is_ok())
+                .then_some(staged)
+        })
+        .collect()
 }
 
 pub(crate) fn first_line(text: &str) -> String {
@@ -327,6 +351,34 @@ pub fn parse_report_text(text: &str) -> Option<DrcReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `kicad-cli` reads a board's project and custom rules from files that
+    /// share the board's name. The candidate board has another name than the
+    /// exported one, so the export's rules are staged beside it, and only
+    /// where nothing is there already.
+    #[test]
+    fn the_exports_rules_are_staged_beside_a_candidate_board() {
+        let dir = std::env::temp_dir().join(format!("synth-drc-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("b.kicad_dru"), "rules").expect("dru");
+        std::fs::write(dir.join("b.kicad_pro"), "project").expect("pro");
+        std::fs::write(dir.join("b.freerouting.kicad_pro"), "kept").expect("existing");
+        let board = dir.join("b.freerouting.kicad_pcb");
+
+        let staged = stage_project_files(&dir, "b", &board);
+
+        assert_eq!(staged, vec![dir.join("b.freerouting.kicad_dru")]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.freerouting.kicad_dru")).unwrap(),
+            "rules"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.freerouting.kicad_pro")).unwrap(),
+            "kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_clean_report_is_clean() {
