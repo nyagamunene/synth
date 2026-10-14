@@ -169,11 +169,10 @@ pub fn run_detailed(board_path: &Path, request: &RouteRequest) -> DrcReport {
         board_path.display().to_string(),
     ];
 
-    let staged = stage_project_files(&request.out_dir, &request.stem, board_path);
-    let result = crate::process::run(Path::new(&cli), &args, DRC_BUDGET, DRC_OUTPUT_CAP);
-    for file in staged {
-        let _ = std::fs::remove_file(file);
-    }
+    let result = {
+        let _staged = StagedProject::stage(&request.out_dir, &request.stem, board_path);
+        crate::process::run(Path::new(&cli), &args, DRC_BUDGET, DRC_OUTPUT_CAP)
+    };
     let invocation = match result {
         Ok(invocation) => invocation,
         Err(error) => {
@@ -207,23 +206,46 @@ pub fn run_detailed(board_path: &Path, request: &RouteRequest) -> DrcReport {
     })
 }
 
-/// Copy the export's project file and custom rules next to `board_path`.
+/// The export's project file and custom rules, copied next to a candidate board
+/// for one DRC run.
 ///
 /// `kicad-cli` reads both from files that share the board's name, and the
 /// routed candidate is named differently from the export, so without this the
 /// DRC runs on KiCad's own defaults, not the rules the export wrote. A file
-/// already beside the board is left alone. Returns the files this call made,
-/// for the caller to remove.
-fn stage_project_files(export_dir: &Path, export_stem: &str, board_path: &Path) -> Vec<PathBuf> {
-    ["kicad_pro", "kicad_dru"]
-        .into_iter()
-        .filter_map(|extension| {
-            let source = export_dir.join(format!("{export_stem}.{extension}"));
-            let staged = board_path.with_extension(extension);
-            (source.is_file() && !staged.exists() && std::fs::copy(&source, &staged).is_ok())
-                .then_some(staged)
-        })
-        .collect()
+/// already beside the board (left by an earlier run, or written by KiCad) is
+/// overwritten for the run, so it cannot decide the rules, and is put back when
+/// the guard is dropped; a file that was not there is removed.
+struct StagedProject {
+    /// Each staged path with what was there before, if anything.
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
+impl StagedProject {
+    fn stage(export_dir: &Path, export_stem: &str, board_path: &Path) -> Self {
+        let files = ["kicad_pro", "kicad_dru"]
+            .into_iter()
+            .filter_map(|extension| {
+                let source = export_dir.join(format!("{export_stem}.{extension}"));
+                let staged = board_path.with_extension(extension);
+                let rules = std::fs::read(&source).ok()?;
+                let before = std::fs::read(&staged).ok();
+                std::fs::write(&staged, rules).ok()?;
+                Some((staged, before))
+            })
+            .collect();
+        Self { files }
+    }
+}
+
+impl Drop for StagedProject {
+    fn drop(&mut self) {
+        for (path, before) in &self.files {
+            let _ = match before {
+                Some(content) => std::fs::write(path, content),
+                None => std::fs::remove_file(path),
+            };
+        }
+    }
 }
 
 pub(crate) fn first_line(text: &str) -> String {
@@ -352,30 +374,60 @@ pub fn parse_report_text(text: &str) -> Option<DrcReport> {
 mod tests {
     use super::*;
 
-    /// `kicad-cli` reads a board's project and custom rules from files that
-    /// share the board's name. The candidate board has another name than the
-    /// exported one, so the export's rules are staged beside it, and only
-    /// where nothing is there already.
-    #[test]
-    fn the_exports_rules_are_staged_beside_a_candidate_board() {
-        let dir = std::env::temp_dir().join(format!("synth-drc-stage-{}", std::process::id()));
+    fn staging_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("synth-drc-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("b.kicad_dru"), "rules").expect("dru");
         std::fs::write(dir.join("b.kicad_pro"), "project").expect("pro");
-        std::fs::write(dir.join("b.freerouting.kicad_pro"), "kept").expect("existing");
+        dir
+    }
+
+    /// `kicad-cli` reads a board's project and custom rules from files that
+    /// share the board's name. The candidate board has another name than the
+    /// exported one, so the export's rules are staged beside it for the run.
+    #[test]
+    fn the_exports_rules_are_staged_beside_a_candidate_board() {
+        let dir = staging_dir("stage");
         let board = dir.join("b.freerouting.kicad_pcb");
-
-        let staged = stage_project_files(&dir, "b", &board);
-
-        assert_eq!(staged, vec![dir.join("b.freerouting.kicad_dru")]);
+        let staged = StagedProject::stage(&dir, "b", &board);
         assert_eq!(
             std::fs::read_to_string(dir.join("b.freerouting.kicad_dru")).unwrap(),
             "rules"
         );
         assert_eq!(
             std::fs::read_to_string(dir.join("b.freerouting.kicad_pro")).unwrap(),
-            "kept"
+            "project"
+        );
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sidecar left beside the candidate by an earlier run (or by KiCad) must
+    /// not decide the rules: this run's export overwrites it, and whatever was
+    /// there is put back afterwards. Files that were not there are removed.
+    #[test]
+    fn a_stale_sidecar_is_overwritten_for_the_run_and_restored_after() {
+        let dir = staging_dir("stale");
+        std::fs::write(dir.join("b.freerouting.kicad_dru"), "stale rules").unwrap();
+        let board = dir.join("b.freerouting.kicad_pcb");
+
+        let staged = StagedProject::stage(&dir, "b", &board);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.freerouting.kicad_dru")).unwrap(),
+            "rules",
+            "the run must see this export's rules, not the stale file"
+        );
+        drop(staged);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.freerouting.kicad_dru")).unwrap(),
+            "stale rules",
+            "a file that was there before is put back"
+        );
+        assert!(
+            !dir.join("b.freerouting.kicad_pro").exists(),
+            "a file that was not there before is removed"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
