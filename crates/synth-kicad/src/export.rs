@@ -324,24 +324,7 @@ fn export_inner(
     // any page, and the project file is board-wide.
     let net_settings = build_net_settings(board, sheets.iter().map(|s| &s.layout));
     let project_doc = json!({
-        // Keep the project-level defaults explicit. KiCad 10 may discard
-        // legacy setup minima when it first saves a generated board, and an
-        // empty `board` object then silently restores its own 0.2 mm
-        // clearance. These values match the router's 0.2 mm signal width
-        // and the 0.127 mm clearance supported by the default manufacturer
-        // profile, so native DRC sees the same contract as Synth.
-        "board": {
-          "design_settings": {
-            "defaults": {
-              "min_clearance": 0.127,
-              "min_track_width": 0.127,
-            },
-            "rules": {
-              "min_clearance": 0.127,
-              "min_track_width": 0.127,
-            }
-          }
-        },
+        "board": board_design_settings(),
         "boards": [],
         "meta": {
             "filename": format!("{stem}.kicad_pro"),
@@ -588,18 +571,7 @@ pub fn export_schematic_only(
         .collect();
     let net_settings = build_net_settings(board, sheets.iter().map(|s| &s.layout));
     let project_doc = json!({
-        "board": {
-          "design_settings": {
-            "defaults": {
-              "min_clearance": 0.127,
-              "min_track_width": 0.127,
-            },
-            "rules": {
-              "min_clearance": 0.127,
-              "min_track_width": 0.127,
-            }
-          }
-        },
+        "board": board_design_settings(),
         "boards": [],
         "meta": {
             "filename": format!("{stem}.kicad_pro"),
@@ -910,6 +882,28 @@ fn placement_score(board: &Board, placement: &synth_place::Placement) -> usize {
     .len()
 }
 
+/// The board-level rules the project file carries, so native DRC sees the same
+/// contract as Synth. KiCad 10 may discard legacy setup minima when it first
+/// saves a generated board, and an empty `board` object then silently restores
+/// its own defaults: 0.2 mm clearance and 0.5 mm copper-to-edge. The values
+/// match the default manufacturer profile: 0.127 mm track and clearance, and
+/// 0.2 mm from copper to a routed edge or an NPTH hole (JLCPCB capabilities).
+fn board_design_settings() -> serde_json::Value {
+    json!({
+        "design_settings": {
+            "defaults": {
+                "min_clearance": 0.127,
+                "min_track_width": 0.127,
+            },
+            "rules": {
+                "min_clearance": 0.127,
+                "min_track_width": 0.127,
+                "min_copper_edge_clearance": 0.2,
+            }
+        }
+    })
+}
+
 /// Build the `.kicad_pro` `net_settings` block (schematic-quality
 /// plan Phase B1).
 ///
@@ -1207,6 +1201,16 @@ mod tests {
         // Declared width/clearance flow through.
         assert_eq!(pwr["track_width"], 0.5);
         assert_eq!(pwr["clearance"], 0.2);
+    }
+
+    /// KiCad measures copper against the board edge and against NPTH holes with
+    /// the same rule and defaults it to 0.5 mm; JLCPCB's stated minimum for
+    /// both is 0.2 mm, so the project file has to carry that value.
+    #[test]
+    fn project_rules_carry_the_manufacturer_edge_clearance() {
+        let rules = &board_design_settings()["design_settings"]["rules"];
+        assert_eq!(rules["min_copper_edge_clearance"], 0.2);
+        assert_eq!(rules["min_clearance"], 0.127);
     }
 
     /// A class with no declared clearance gets the manufacturer minimum the
