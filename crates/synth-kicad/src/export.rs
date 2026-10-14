@@ -911,13 +911,15 @@ fn placement_score(board: &Board, placement: &synth_place::Placement) -> usize {
     .len()
 }
 
-/// The project's custom DRC rules (`<board>.kicad_dru`). KiCad measures copper
-/// against the board edge and against NPTH holes with one rule that defaults to
-/// 0.5 mm and that `kicad-cli` does not read from the project file, so the
-/// manufacturer's 0.2 mm (JLCPCB: copper to a routed edge, NPTH to track) goes
-/// in as a custom rule.
+/// The project's custom DRC rules (`<board>.kicad_dru`). KiCad checks copper
+/// against the board edge and against holes with rules that default to 0.5 mm
+/// and 0.25 mm, and `kicad-cli` does not read them from the project file, so
+/// the manufacturer's 0.2 mm (JLCPCB: copper to a routed edge, NPTH and via
+/// hole to track) goes in as custom rules.
 fn design_rules() -> &'static str {
-    "(version 1)\n(rule \"manufacturer copper to edge and NPTH\"\n  (constraint edge_clearance (min 0.2mm)))\n"
+    "(version 1)\n\
+     (rule \"manufacturer copper to edge\"\n  (constraint edge_clearance (min 0.2mm)))\n\
+     (rule \"manufacturer copper to hole\"\n  (constraint hole_clearance (min 0.2mm)))\n"
 }
 
 /// Build the `.kicad_pro` `net_settings` block (schematic-quality
@@ -1224,12 +1226,13 @@ mod tests {
     /// the project file: it takes a custom rule. JLCPCB's stated minimum for
     /// both is 0.2 mm.
     #[test]
-    fn custom_rules_carry_the_manufacturer_edge_clearance() {
-        assert!(
-            design_rules().contains("(constraint edge_clearance (min 0.2mm))"),
-            "{}",
-            design_rules()
-        );
+    fn custom_rules_carry_the_manufacturer_edge_and_hole_clearance() {
+        for constraint in [
+            "(constraint edge_clearance (min 0.2mm))",
+            "(constraint hole_clearance (min 0.2mm))",
+        ] {
+            assert!(design_rules().contains(constraint), "{}", design_rules());
+        }
     }
 
     /// A class with no declared clearance gets the manufacturer minimum the
