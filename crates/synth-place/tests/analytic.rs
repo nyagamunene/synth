@@ -49,6 +49,9 @@ fn fixtures() -> [&'static str; 4] {
 
 type PlacementCandidate = fn(&Board) -> Result<synth_place::Placement, synth_place::PlaceError>;
 
+type PlaceWithSidecar =
+    fn(&Board, Option<&std::path::Path>) -> Result<synth_place::Placement, synth_place::PlaceError>;
+
 fn candidates() -> [(&'static str, PlacementCandidate); 2] {
     [
         ("unspaced", synth_place::place_with_analytic_seed),
@@ -149,9 +152,27 @@ fn analytic_seed_is_deterministic() {
 
 #[test]
 fn analytic_seed_honours_an_absolute_sidecar_pin() {
+    assert_sidecar_pin(
+        synth_place::place_with_analytic_seed_and_sidecar,
+        "unspaced",
+    );
+}
+
+#[test]
+fn spaced_analytic_seed_honours_an_absolute_sidecar_pin() {
+    assert_sidecar_pin(
+        synth_place::place_with_analytic_seed_spaced_and_sidecar,
+        "spaced",
+    );
+}
+
+fn assert_sidecar_pin(place: PlaceWithSidecar, label: &str) {
     let board = load_board("fixtures/designs/ten_caps.synth");
     let first = board.components[0].refdes.clone();
-    let dir = std::env::temp_dir().join(format!("synth-analytic-sidecar-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "synth-analytic-sidecar-{label}-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let sidecar = dir.join("ten_caps.placement.layout.toml");
     std::fs::write(
@@ -160,8 +181,8 @@ fn analytic_seed_honours_an_absolute_sidecar_pin() {
     )
     .expect("write sidecar");
 
-    let placement = synth_place::place_with_analytic_seed_and_sidecar(&board, Some(&sidecar))
-        .expect("analytic placement with a pinned sidecar");
+    let placement = place(&board, Some(&sidecar))
+        .unwrap_or_else(|error| panic!("{label}: sidecar placement failed: {error:?}"));
     let placed = placement
         .components
         .iter()
@@ -170,11 +191,15 @@ fn analytic_seed_honours_an_absolute_sidecar_pin() {
     assert!(
         (synth_geometry::nm_to_mm(placed.center.x_nm) - 20.0).abs() < 0.01
             && (synth_geometry::nm_to_mm(placed.center.y_nm) - 20.0).abs() < 0.01,
-        "pinned {first} moved to ({}, {})",
+        "{label}: pinned {first} moved to ({}, {})",
         synth_geometry::nm_to_mm(placed.center.x_nm),
         synth_geometry::nm_to_mm(placed.center.y_nm)
     );
-    assert_legal(&board, &placement, "ten_caps with a pinned sidecar");
+    assert_legal(
+        &board,
+        &placement,
+        &format!("ten_caps ({label}) with a pinned sidecar"),
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

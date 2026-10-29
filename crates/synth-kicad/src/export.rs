@@ -242,10 +242,12 @@ pub fn placement_for_export(
 /// Candidate placements for a caller that can route and wants to choose.
 ///
 /// A superset of what [`export_with_sidecars`] itself chooses among: the
-/// export's own candidates plus a spread of placement-margin variants, so a
-/// place→route→re-place loop has genuinely different arrangements to route.
-/// Ordered deterministically, duplicates removed; the first is always the
-/// export's own preferred placement.
+/// export's own candidates, a spread of placement-margin variants, and the
+/// unspaced/spaced analytical seeds, so a place→route→re-place loop has
+/// genuinely different arrangements to route. Ordered deterministically,
+/// duplicates removed. The first entry is the hinted placement; the export's
+/// own route-free choice is [`placement_for_export`], which ranks the base set
+/// by route-aware legality and area.
 ///
 /// # Errors
 /// [`ExportError::Placement`] when the placer finds no legal placement.
@@ -253,7 +255,7 @@ pub fn placement_candidates(
     board: &Board,
     sidecars: &Sidecars,
 ) -> Result<Vec<synth_place::Placement>, ExportError> {
-    place_candidates_with_margins(board, sidecars.placement_path(), &[0.5, 2.5], &[1, 2])
+    place_candidates_with_margins(board, sidecars.placement_path(), &[0.5, 2.5], &[1, 2], true)
         .map_err(|source| ExportError::Placement { source })
 }
 
@@ -691,7 +693,13 @@ fn place_candidates(
     // Seeds 1 to 8: widening to 1..16 reproduced env_logger's failing
     // arrangement. 1.25 and 1.0 mm are the two density steps below the 1.5 mm
     // base that improved the tuning corpus without breaking a board.
-    place_candidates_with_margins(board, sidecar, &[1.25, 1.0], &[1, 2, 3, 4, 5, 6, 7, 8])
+    place_candidates_with_margins(
+        board,
+        sidecar,
+        &[1.25, 1.0],
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        false,
+    )
 }
 
 /// One step below the tightest caller margin, tried only on dense boards.
@@ -730,6 +738,7 @@ fn place_candidates_with_margins(
     sidecar: Option<&Path>,
     extra_margins: &[f64],
     extra_seeds: &[u64],
+    include_analytic: bool,
 ) -> Result<Vec<synth_place::Placement>, synth_place::PlaceError> {
     // Match synth-place::place() and the MCP gates. Starting the export
     // with a different courtyard margin can select a different legal
@@ -817,6 +826,22 @@ fn place_candidates_with_margins(
                 sidecar,
                 seed,
             ) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    // The analytical seeds are route-loop candidates, not part of the
+    // route-free export choice. The local four-board A/B (#383) measured the
+    // unspaced seed on sensor_logger/secure_tracker and the spaced seed on
+    // feather_m4_express; a failure here must never remove the export's own
+    // candidates.
+    if include_analytic {
+        for place in [
+            synth_place::place_with_analytic_seed_and_sidecar,
+            synth_place::place_with_analytic_seed_spaced_and_sidecar,
+        ] {
+            if let Ok(candidate) = place(board, sidecar) {
                 candidates.push(candidate);
             }
         }

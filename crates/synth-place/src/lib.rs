@@ -1201,11 +1201,21 @@ pub fn place_with_analytic_seed(board: &Board) -> Result<Placement, PlaceError> 
 /// the caller (the route loop) must choose between this and the unspaced
 /// candidate. It is not wired into [`place`].
 pub fn place_with_analytic_seed_spaced(board: &Board) -> Result<Placement, PlaceError> {
+    place_with_analytic_seed_spaced_and_sidecar(board, None)
+}
+
+/// [`place_with_analytic_seed_spaced`] with the optional PCB-placement
+/// sidecar. The route loop uses this form so a pinned sidecar applies to both
+/// analytical candidates.
+pub fn place_with_analytic_seed_spaced_and_sidecar(
+    board: &Board,
+    sidecar_path: Option<&std::path::Path>,
+) -> Result<Placement, PlaceError> {
     place_with_tuning_and_sidecar_seeded_mode(
         board,
         DEFAULT_MARGIN_MM,
         &default_rotation_overrides(board),
-        None,
+        sidecar_path,
         0,
         SeedMode::Analytic {
             spacing_mm: analytic::ROUTING_GAP_MM,
