@@ -1176,13 +1176,13 @@ pub fn place(board: &Board) -> Result<Placement, PlaceError> {
 /// Which global seed the target-point search starts from.
 ///
 /// `Cem` is the production default. `Analytic` is the opt-in quadratic
-/// wirelength seed used by [`place_with_analytic_seed`] for the A/B against
-/// the current placer; it is not selected by [`place`] until the routed
-/// comparison proves it.
+/// wirelength seed; its `spacing_mm` carries the optional routing gap used by
+/// [`place_with_analytic_seed_spaced`]. Neither entry point is selected by
+/// [`place`] until the routed comparison proves it.
 #[derive(Clone, Copy)]
 enum SeedMode {
     Cem,
-    Analytic,
+    Analytic { spacing_mm: f64 },
 }
 
 /// Place with the analytical quadratic-wirelength seed.
@@ -1192,6 +1192,25 @@ enum SeedMode {
 /// not the production default.
 pub fn place_with_analytic_seed(board: &Board) -> Result<Placement, PlaceError> {
     place_with_analytic_seed_and_sidecar(board, None)
+}
+
+/// The analytical seed with the extra routing gap.
+///
+/// A candidate, not a replacement: the A/B showed the gap fixes
+/// `feather_m4_express` (6 -> 2 unrouted) while it hurts `secure_tracker`, so
+/// the caller (the route loop) must choose between this and the unspaced
+/// candidate. It is not wired into [`place`].
+pub fn place_with_analytic_seed_spaced(board: &Board) -> Result<Placement, PlaceError> {
+    place_with_tuning_and_sidecar_seeded_mode(
+        board,
+        DEFAULT_MARGIN_MM,
+        &default_rotation_overrides(board),
+        None,
+        0,
+        SeedMode::Analytic {
+            spacing_mm: analytic::ROUTING_GAP_MM,
+        },
+    )
 }
 
 /// [`place_with_analytic_seed`] with the optional PCB-placement sidecar.
@@ -1208,7 +1227,7 @@ pub fn place_with_analytic_seed_and_sidecar(
         &default_rotation_overrides(board),
         sidecar_path,
         0,
-        SeedMode::Analytic,
+        SeedMode::Analytic { spacing_mm: 0.0 },
     )
 }
 
@@ -2107,7 +2126,7 @@ fn place_with_outline<S: ::std::hash::BuildHasher>(
     let pad_offsets = build_pad_offset_lookup(board);
     let region_hints = match seed_mode {
         SeedMode::Cem => cem::cem_region_assign(board, usable),
-        SeedMode::Analytic => analytic::region_assign(
+        SeedMode::Analytic { spacing_mm } => analytic::region_assign(
             board,
             usable,
             &fp_targets,
@@ -2115,6 +2134,7 @@ fn place_with_outline<S: ::std::hash::BuildHasher>(
             pinned,
             &courtyard_lookup,
             &pad_offsets,
+            spacing_mm,
         ),
     };
 

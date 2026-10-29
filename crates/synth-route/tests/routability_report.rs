@@ -245,11 +245,12 @@ fn analytic_seed_does_not_increase_unrouted_nets_on_small_designs() {
 
 /// The final gate on the 62-part RP2350 board.
 ///
-/// The current quadratic seed fails this test: HPWL improves, but unrouted
-/// nets rise from 4 to 6. It stays here as a red gate so the next iteration
-/// cannot quietly claim the seed is safe on a dense board.
+/// This is the spaced candidate: the unspaced seed packs the board to 260 mm
+/// of track and loses two nets (4 -> 6), while the 2 mm gap brings it to 2.
+/// `secure_tracker` keeps the unspaced candidate, which is why the route loop
+/// must choose between the two rather than force one gap on every board.
 #[test]
-#[ignore = "release-mode final gate; currently fails on feather"]
+#[ignore = "release-mode final gate"]
 fn analytic_seed_feather_is_the_final_gate() {
     let path = "../../fixtures/designs/feather_m4_express.synth";
     if !Path::new(path).exists() {
@@ -257,11 +258,18 @@ fn analytic_seed_feather_is_the_final_gate() {
     }
     let board = load_board(path);
     let default = synth_place::place(&board).expect("default placement");
-    let analytic = synth_place::place_with_analytic_seed(&board).expect("analytic placement");
+    let analytic =
+        synth_place::place_with_analytic_seed_spaced(&board).expect("spaced analytic placement");
     let default_routing = synth_route::route(&board, &default);
     let analytic_routing = synth_route::route(&board, &analytic);
+    let default_hpwl = synth_geometry::nm_to_mm(
+        synth_place::score::score_placement(&board, &default).hpwl_total_nm,
+    );
+    let analytic_hpwl = synth_geometry::nm_to_mm(
+        synth_place::score::score_placement(&board, &analytic).hpwl_total_nm,
+    );
     println!(
-        "default unrouted {} ({:?}), analytic unrouted {} ({:?})",
+        "default hpwl {default_hpwl:.1} mm, unrouted {} ({:?}); analytic hpwl {analytic_hpwl:.1} mm, unrouted {} ({:?})",
         default_routing.unrouted_nets.len(),
         default_routing
             .unrouted_nets
@@ -281,6 +289,10 @@ fn analytic_seed_feather_is_the_final_gate() {
         path,
         analytic_routing.unrouted_nets.len(),
         default_routing.unrouted_nets.len()
+    );
+    assert!(
+        analytic_hpwl <= default_hpwl,
+        "{path}: analytic seed HPWL {analytic_hpwl:.1} mm, default {default_hpwl:.1} mm"
     );
 }
 

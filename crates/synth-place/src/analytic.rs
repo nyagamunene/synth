@@ -14,11 +14,12 @@
 //! and HPWL metric use, so a pin is the point the netlist names, not the body
 //! centre.
 //!
-//! Scope is quadratic wirelength only. Density, WA/Nesterov, rotation
-//! optimisation and legalisation stay out of this module: the prototype showed
-//! the density term costs final HPWL on the reference toy board, so it is not
-//! in v1. A dense-part keep-out projection is applied after the solve as a
-//! hard routing constraint, not as a density objective. See
+//! Scope is quadratic wirelength plus deterministic fan-out and routing-gap
+//! projections. Density, WA/Nesterov, rotation optimisation and legalisation
+//! stay out of this module: the prototype showed the density term costs final
+//! HPWL on the reference toy board, so it is not in v1. The routing gap is a
+//! second candidate, not a global rule; see the spaced entry point in
+//! [`crate::place_with_analytic_seed_spaced`]. See
 //! `docs/analytical-placement.md` for the model and the
 //! `prototype/analytic-placement` branch for the feel test.
 
@@ -44,6 +45,20 @@ const CG_TOLERANCE: f64 = 1e-9;
 /// against the unit net weights.
 const CENTER_ANCHOR: f64 = 1e-5;
 
+/// Extra routing gap for the spaced candidate, in millimetres.
+///
+/// The inflated courtyard already carries the placer's 1.5 mm margin. This
+/// adds the channel the router needs on a dense board: without it
+/// `feather_m4_express` packs to 260 mm of track against the default 389 mm
+/// and loses two nets. The gap is a candidate, not a global rule: any nonzero
+/// value also flips `secure_tracker` to 5-7 unrouted, so the unspaced
+/// candidate stays available for the route loop to choose.
+pub(crate) const ROUTING_GAP_MM: f64 = 2.0;
+
+/// Bounded projection passes. The constraints converge in a few passes on
+/// the reference boards; the cap stops a crowded board from cycling.
+const SPACING_PASSES: usize = 8;
+
 /// One placement instance in the linear system. The fields stay private to
 /// the module; the unit tests build it directly.
 struct Problem {
@@ -53,6 +68,7 @@ struct Problem {
     dense: Vec<bool>,
     nets: Vec<Vec<(usize, (f64, f64))>>,
     usable: Rect,
+    spacing_nm: f64,
 }
 
 /// Produce region hints from the analytical seed.
@@ -70,6 +86,7 @@ pub(crate) fn region_assign(
     pinned: &PinnedPlacements,
     courtyard_lookup: &HashMap<ComponentId, (f64, f64)>,
     pad_offsets: &PadOffsetLookup,
+    spacing_mm: f64,
 ) -> RegionAssignment {
     let anchors = anchor_positions(board, usable, fp_targets, rotation_overrides, pinned);
     let mut ids = Vec::with_capacity(board.components.len());
@@ -127,6 +144,7 @@ pub(crate) fn region_assign(
         dense,
         nets,
         usable,
+        spacing_nm: mm_to_nm(spacing_mm) as f64,
     };
     let solved = solve(&problem);
     let hints = ids
@@ -322,8 +340,29 @@ fn solve(problem: &Problem) -> Vec<Point> {
         }
     }
 
-    push_out_of_dense_rings(problem, &mut centers);
+    project_constraints(problem, &mut centers);
     centers
+}
+
+/// Apply the dense-ring and pairwise-spacing constraints together.
+///
+/// The dense ring keeps passives out of an MCU's fan-out; the pairwise gap
+/// keeps routing channels between everything else. They can fight, so the
+/// final pass is always the ring: a passive in a fan-out corridor is a harder
+/// failure than a tight pair, and the legaliser handles the residual overlap.
+fn project_constraints(problem: &Problem, centers: &mut [Point]) {
+    for _ in 0..SPACING_PASSES {
+        let ring_changed = push_out_of_dense_rings_once(problem, centers);
+        let spacing_changed = if problem.spacing_nm > 0.0 {
+            push_apart_once(problem, centers)
+        } else {
+            false
+        };
+        if !ring_changed && !spacing_changed {
+            break;
+        }
+    }
+    let _ = push_out_of_dense_rings_once(problem, centers);
 }
 
 /// Keep passives out of the fan-out ring around dense parts.
@@ -332,48 +371,117 @@ fn solve(problem: &Problem) -> Vec<Point> {
 /// pins a [`crate::DENSE_PART_RING_MM`] ring so the router can escape its
 /// pins. A pure wirelength solve pulls decoupling parts straight into that
 /// ring, which is exactly the case the real-board A/B caught: lower HPWL,
-/// more unrouted nets. The projection is deterministic and repeats until no
-/// part can move or four passes have run.
-fn push_out_of_dense_rings(problem: &Problem, centers: &mut [Point]) {
+/// more unrouted nets. One pass, deterministic order; the caller bounds the
+/// repetition.
+fn push_out_of_dense_rings_once(problem: &Problem, centers: &mut [Point]) -> bool {
     let ring_nm = mm_to_nm(crate::DENSE_PART_RING_MM) as f64;
-    for _ in 0..4 {
-        let mut changed = false;
-        for first in 0..centers.len() {
-            if !problem.free[first] || problem.dense[first] {
+    let mut changed = false;
+    for first in 0..centers.len() {
+        if !problem.free[first] || problem.dense[first] {
+            continue;
+        }
+        for second in 0..centers.len() {
+            if first == second || !problem.dense[second] {
                 continue;
             }
-            for second in 0..centers.len() {
-                if first == second || !problem.dense[second] {
-                    continue;
-                }
-                let (first_half_w, first_half_h) = problem.half[first];
-                let (second_half_w, second_half_h) = problem.half[second];
-                let need_x = first_half_w + second_half_w + ring_nm;
-                let need_y = first_half_h + second_half_h + ring_nm;
-                let mut point = centers[first];
-                let dx = (point.x_nm - centers[second].x_nm) as f64;
-                let dy = (point.y_nm - centers[second].y_nm) as f64;
-                if dx.abs() >= need_x || dy.abs() >= need_y {
-                    continue;
-                }
-                let push_x = need_x - dx.abs();
-                let push_y = need_y - dy.abs();
-                if push_x <= push_y {
-                    let direction = if dx >= 0.0 { 1.0 } else { -1.0 };
-                    point.x_nm += (direction * push_x).round() as i64;
-                } else {
-                    let direction = if dy >= 0.0 { 1.0 } else { -1.0 };
-                    point.y_nm += (direction * push_y).round() as i64;
-                }
-                clamp_center(problem, first, &mut point);
-                centers[first] = point;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
+            changed |= push_pair(problem, centers, first, second, ring_nm, false);
         }
     }
+    changed
+}
+
+/// Push free parts apart until every pair has the extra routing gap.
+///
+/// Free-free pairs split the penetration; a free-anchor pair moves only the
+/// free part. Anchors are sidecar pins, absolute hints and floorplan targets,
+/// so a mechanical constraint never moves for a channel.
+fn push_apart_once(problem: &Problem, centers: &mut [Point]) -> bool {
+    let mut changed = false;
+    for first in 0..centers.len() {
+        for second in (first + 1)..centers.len() {
+            if !problem.free[first] && !problem.free[second] {
+                continue;
+            }
+            changed |= push_pair(problem, centers, first, second, problem.spacing_nm, true);
+        }
+    }
+    changed
+}
+
+/// Resolve one pair along its smaller penetration axis.
+///
+/// `split_free_pair` is the only difference between the fan-out ring and the
+/// routing gap: the ring moves the passive away from a dense part and leaves
+/// the dense part alone even when it is free, while two free parts share the
+/// spacing push. The shift is split without losing the odd nanometre, and the
+/// return value is true only when a point actually moved.
+fn push_pair(
+    problem: &Problem,
+    centers: &mut [Point],
+    first: usize,
+    second: usize,
+    gap_nm: f64,
+    split_free_pair: bool,
+) -> bool {
+    let first_free = problem.free[first];
+    let second_free = problem.free[second];
+    if !first_free && !second_free {
+        return false;
+    }
+    let (first_half_w, first_half_h) = problem.half[first];
+    let (second_half_w, second_half_h) = problem.half[second];
+    let need_x = first_half_w + second_half_w + gap_nm;
+    let need_y = first_half_h + second_half_h + gap_nm;
+    let dx = (centers[first].x_nm - centers[second].x_nm) as f64;
+    let dy = (centers[first].y_nm - centers[second].y_nm) as f64;
+    if dx.abs() >= need_x || dy.abs() >= need_y {
+        return false;
+    }
+
+    let push_x = need_x - dx.abs();
+    let push_y = need_y - dy.abs();
+    let (axis_x, direction, magnitude) = if push_x <= push_y {
+        (
+            true,
+            if dx >= 0.0 { 1_i64 } else { -1_i64 },
+            push_x.round() as i64,
+        )
+    } else {
+        (
+            false,
+            if dy >= 0.0 { 1_i64 } else { -1_i64 },
+            push_y.round() as i64,
+        )
+    };
+
+    let (first_shift, second_shift) = if split_free_pair && first_free && second_free {
+        let half = magnitude / 2;
+        (half, magnitude - half)
+    } else if first_free {
+        (magnitude, 0)
+    } else {
+        (0, magnitude)
+    };
+
+    let mut first_point = centers[first];
+    let mut second_point = centers[second];
+    if axis_x {
+        first_point.x_nm += direction * first_shift;
+        second_point.x_nm -= direction * second_shift;
+    } else {
+        first_point.y_nm += direction * first_shift;
+        second_point.y_nm -= direction * second_shift;
+    }
+    if first_free {
+        clamp_center(problem, first, &mut first_point);
+    }
+    if second_free {
+        clamp_center(problem, second, &mut second_point);
+    }
+    let moved = first_point != centers[first] || second_point != centers[second];
+    centers[first] = first_point;
+    centers[second] = second_point;
+    moved
 }
 
 fn clamp_center(problem: &Problem, position: usize, center: &mut Point) {
@@ -500,6 +608,7 @@ mod tests {
             dense: vec![false; count],
             nets,
             usable: Rect::new(Point::new(0, 0), Point::new(100_000_000, 100_000_000)),
+            spacing_nm: 0.0,
         }
     }
 
@@ -529,11 +638,14 @@ mod tests {
 
     #[test]
     fn pad_offsets_move_the_body_not_the_centre() {
-        let instance = problem(
+        let mut instance = problem(
             vec![false, true],
             vec![Some((10_000_000.0, 50_000_000.0)), None],
             vec![vec![(0, (5_000_000.0, 0.0)), (1, (-5_000_000.0, 0.0))]],
         );
+        // Isolate the pad-offset effect from the routing gap: the solved
+        // centres are 10 mm apart, which is already wider than 2 mm.
+        instance.half = vec![(0.0, 0.0); 2];
 
         let solved = solve(&instance);
         assert!(
@@ -551,14 +663,52 @@ mod tests {
     }
 
     #[test]
-    fn two_free_parts_on_one_net_settle_together() {
-        let instance = problem(
+    fn two_free_parts_on_one_net_keep_the_spacing_gap() {
+        let mut instance = problem(
             vec![true, true],
             vec![None, None],
             vec![vec![(0, (0.0, 0.0)), (1, (0.0, 0.0))]],
         );
+        instance.spacing_nm = mm_to_nm(ROUTING_GAP_MM) as f64;
         let solved = solve(&instance);
-        assert_eq!(solved[0], solved[1]);
+        let needed = 2.0 * 5_000_000.0 + instance.spacing_nm;
+        let dx = (solved[0].x_nm - solved[1].x_nm).abs() as f64;
+        let dy = (solved[0].y_nm - solved[1].y_nm).abs() as f64;
+        assert!(
+            dx >= needed - 1.0 || dy >= needed - 1.0,
+            "parts stayed {dx} x {dy} nm apart, need {needed} on one axis"
+        );
+    }
+
+    #[test]
+    fn spacing_moves_the_free_part_and_not_the_anchor() {
+        let mut instance = problem(
+            vec![false, true],
+            vec![Some((10_000_000.0, 50_000_000.0)), None],
+            vec![vec![(0, (0.0, 0.0)), (1, (0.0, 0.0))]],
+        );
+        instance.spacing_nm = mm_to_nm(ROUTING_GAP_MM) as f64;
+        let solved = solve(&instance);
+        assert_eq!(solved[0], Point::new(10_000_000, 50_000_000));
+        let needed = 2.0 * 5_000_000.0 + instance.spacing_nm;
+        let dx = (solved[0].x_nm - solved[1].x_nm).abs() as f64;
+        let dy = (solved[0].y_nm - solved[1].y_nm).abs() as f64;
+        assert!(
+            dx >= needed - 1.0 || dy >= needed - 1.0,
+            "free part stayed {dx} x {dy} nm from its anchor, need {needed}"
+        );
+    }
+
+    #[test]
+    fn already_separated_parts_do_not_move() {
+        let mut instance = problem(
+            vec![false, true],
+            vec![Some((10_000_000.0, 50_000_000.0)), None],
+            Vec::new(),
+        );
+        instance.spacing_nm = mm_to_nm(ROUTING_GAP_MM) as f64;
+        let solved = solve(&instance);
+        assert_eq!(solved[1], Point::new(50_000_000, 50_000_000));
     }
 
     #[test]

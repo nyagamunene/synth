@@ -47,6 +47,15 @@ fn fixtures() -> [&'static str; 4] {
     ]
 }
 
+type PlacementCandidate = fn(&Board) -> Result<synth_place::Placement, synth_place::PlaceError>;
+
+fn candidates() -> [(&'static str, PlacementCandidate); 2] {
+    [
+        ("unspaced", synth_place::place_with_analytic_seed),
+        ("spaced", synth_place::place_with_analytic_seed_spaced),
+    ]
+}
+
 #[allow(clippy::similar_names)]
 fn courtyard_rects(board: &Board, placement: &synth_place::Placement) -> Vec<Rect> {
     placement
@@ -110,27 +119,31 @@ fn assert_legal(board: &Board, placement: &synth_place::Placement, label: &str) 
 
 #[test]
 fn analytic_seed_places_real_boards_legally() {
-    for fixture in fixtures() {
-        let board = load_board(fixture);
-        let placement = synth_place::place_with_analytic_seed(&board)
-            .unwrap_or_else(|error| panic!("{fixture}: analytic placement failed: {error:?}"));
-        assert_legal(&board, &placement, fixture);
+    for (label, place) in candidates() {
+        for fixture in fixtures() {
+            let board = load_board(fixture);
+            let placement = place(&board)
+                .unwrap_or_else(|error| panic!("{fixture} ({label}): placement failed: {error:?}"));
+            assert_legal(&board, &placement, &format!("{fixture} ({label})"));
+        }
     }
 }
 
 #[test]
 fn analytic_seed_is_deterministic() {
-    for fixture in [
-        "fixtures/designs/ten_caps.synth",
-        "fixtures/designs/secure_tracker.synth",
-    ] {
-        let board = load_board(fixture);
-        let first = synth_place::place_with_analytic_seed(&board).expect("first placement");
-        let second = synth_place::place_with_analytic_seed(&board).expect("second placement");
-        assert_eq!(
-            first, second,
-            "{fixture}: repeated placement must be identical"
-        );
+    for (label, place) in candidates() {
+        for fixture in [
+            "fixtures/designs/ten_caps.synth",
+            "fixtures/designs/secure_tracker.synth",
+        ] {
+            let board = load_board(fixture);
+            let first = place(&board).expect("first placement");
+            let second = place(&board).expect("second placement");
+            assert_eq!(
+                first, second,
+                "{fixture} ({label}): repeated placement must be identical"
+            );
+        }
     }
 }
 
@@ -194,12 +207,16 @@ fn analytic_seed_hpwl_report() {
         let board = load_board(fixture);
         let default = synth_place::place(&board).expect("default placement");
         let analytic = synth_place::place_with_analytic_seed(&board).expect("analytic placement");
+        let spaced =
+            synth_place::place_with_analytic_seed_spaced(&board).expect("spaced placement");
         let default_hpwl = synth_place::score::score_placement(&board, &default).hpwl_total_nm;
         let analytic_hpwl = synth_place::score::score_placement(&board, &analytic).hpwl_total_nm;
+        let spaced_hpwl = synth_place::score::score_placement(&board, &spaced).hpwl_total_nm;
         println!(
-            "{fixture}: default {:.1} mm HPWL, analytic {:.1} mm HPWL",
+            "{fixture}: default {:.1} mm HPWL, analytic {:.1} mm, spaced {:.1} mm",
             synth_geometry::nm_to_mm(default_hpwl),
-            synth_geometry::nm_to_mm(analytic_hpwl)
+            synth_geometry::nm_to_mm(analytic_hpwl),
+            synth_geometry::nm_to_mm(spaced_hpwl)
         );
     }
 }
