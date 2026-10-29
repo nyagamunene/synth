@@ -128,6 +128,162 @@ fn small_designs_do_not_regress_unrouted_nets() {
     );
 }
 
+/// Analytical seed must not make routing worse than the current placement.
+///
+/// This is the gate the prototype could not answer: a lower HPWL is not a
+/// win if the built-in router loses nets. Run locally in release mode:
+///
+/// `cargo test --release -p synth-route --test routability_report analytic_seed_does_not_regress_unrouted_nets -- --ignored --nocapture`
+///
+/// The final gate on `feather_m4_express` is a separate ignored test so the
+/// three boards this spec names can pass on their own.
+#[test]
+#[ignore = "release-mode A/B; run locally"]
+fn analytic_seed_does_not_regress_unrouted_nets() {
+    for path in [
+        "../../examples/sensor_logger/sensor_logger.synth",
+        "../../fixtures/designs/secure_tracker.synth",
+        "../../fixtures/designs/ten_caps.synth",
+    ] {
+        if !Path::new(path).exists() {
+            continue;
+        }
+        let board = load_board(path);
+        let default = synth_place::place(&board).expect("default placement");
+        let analytic = synth_place::place_with_analytic_seed(&board).expect("analytic placement");
+        let default_routing = synth_route::route(&board, &default);
+        let analytic_routing = synth_route::route(&board, &analytic);
+        let default_hpwl = synth_geometry::nm_to_mm(
+            synth_place::score::score_placement(&board, &default).hpwl_total_nm,
+        );
+        let analytic_hpwl = synth_geometry::nm_to_mm(
+            synth_place::score::score_placement(&board, &analytic).hpwl_total_nm,
+        );
+        let track = |routing: &synth_route::Routing| -> f64 {
+            routing
+                .segments
+                .iter()
+                .map(|segment| {
+                    let dx = synth_geometry::nm_to_mm(segment.end.x_nm - segment.start.x_nm);
+                    let dy = synth_geometry::nm_to_mm(segment.end.y_nm - segment.start.y_nm);
+                    dx.hypot(dy)
+                })
+                .sum()
+        };
+        println!("--- {path}");
+        println!(
+            "  default:  hpwl {default_hpwl:.1} mm, unrouted {}, track {:.1} mm, vias {}",
+            default_routing.unrouted_nets.len(),
+            track(&default_routing),
+            default_routing.vias.len()
+        );
+        println!(
+            "  analytic: hpwl {analytic_hpwl:.1} mm, unrouted {}, track {:.1} mm, vias {}",
+            analytic_routing.unrouted_nets.len(),
+            track(&analytic_routing),
+            analytic_routing.vias.len()
+        );
+        for net in &default_routing.unrouted_nets {
+            println!("  default UNROUTED {}", net.net_name);
+        }
+        for net in &analytic_routing.unrouted_nets {
+            println!("  analytic UNROUTED {}", net.net_name);
+        }
+        let default_by_id: std::collections::HashMap<_, _> = default
+            .components
+            .iter()
+            .map(|placed| (placed.id, placed))
+            .collect();
+        for placed in &analytic.components {
+            let Some(original) = default_by_id.get(&placed.id) else {
+                continue;
+            };
+            let dx = synth_geometry::nm_to_mm(placed.center.x_nm - original.center.x_nm);
+            let dy = synth_geometry::nm_to_mm(placed.center.y_nm - original.center.y_nm);
+            if dx.hypot(dy) > 1.0 {
+                println!(
+                    "  moved {:?}: ({:.1},{:.1}) -> ({:.1},{:.1})",
+                    placed.id,
+                    synth_geometry::nm_to_mm(original.center.x_nm),
+                    synth_geometry::nm_to_mm(original.center.y_nm),
+                    synth_geometry::nm_to_mm(placed.center.x_nm),
+                    synth_geometry::nm_to_mm(placed.center.y_nm)
+                );
+            }
+        }
+        assert!(
+            analytic_routing.unrouted_nets.len() <= default_routing.unrouted_nets.len(),
+            "{path}: analytic seed unrouted {} nets, default {}",
+            analytic_routing.unrouted_nets.len(),
+            default_routing.unrouted_nets.len()
+        );
+    }
+}
+
+/// A fast A/B on small designs, so a placement change that increases
+/// unrouted nets is caught in the normal debug test run.
+#[test]
+fn analytic_seed_does_not_increase_unrouted_nets_on_small_designs() {
+    for path in [
+        "../../fixtures/designs/decoupling_heavy.synth",
+        "../../fixtures/designs/four_components.synth",
+    ] {
+        if !Path::new(path).exists() {
+            continue;
+        }
+        let board = load_board(path);
+        let default = synth_place::place(&board).expect("default placement");
+        let analytic = synth_place::place_with_analytic_seed(&board).expect("analytic placement");
+        let default_unrouted = synth_route::route(&board, &default).unrouted_nets.len();
+        let analytic_unrouted = synth_route::route(&board, &analytic).unrouted_nets.len();
+        assert!(
+            analytic_unrouted <= default_unrouted,
+            "{path}: analytic seed unrouted {analytic_unrouted} nets, default {default_unrouted}"
+        );
+    }
+}
+
+/// The final gate on the 62-part RP2350 board.
+///
+/// The current quadratic seed fails this test: HPWL improves, but unrouted
+/// nets rise from 4 to 6. It stays here as a red gate so the next iteration
+/// cannot quietly claim the seed is safe on a dense board.
+#[test]
+#[ignore = "release-mode final gate; currently fails on feather"]
+fn analytic_seed_feather_is_the_final_gate() {
+    let path = "../../fixtures/designs/feather_m4_express.synth";
+    if !Path::new(path).exists() {
+        return;
+    }
+    let board = load_board(path);
+    let default = synth_place::place(&board).expect("default placement");
+    let analytic = synth_place::place_with_analytic_seed(&board).expect("analytic placement");
+    let default_routing = synth_route::route(&board, &default);
+    let analytic_routing = synth_route::route(&board, &analytic);
+    println!(
+        "default unrouted {} ({:?}), analytic unrouted {} ({:?})",
+        default_routing.unrouted_nets.len(),
+        default_routing
+            .unrouted_nets
+            .iter()
+            .map(|net| net.net_name.as_str())
+            .collect::<Vec<_>>(),
+        analytic_routing.unrouted_nets.len(),
+        analytic_routing
+            .unrouted_nets
+            .iter()
+            .map(|net| net.net_name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        analytic_routing.unrouted_nets.len() <= default_routing.unrouted_nets.len(),
+        "{}: analytic seed unrouted {} nets, default {}",
+        path,
+        analytic_routing.unrouted_nets.len(),
+        default_routing.unrouted_nets.len()
+    );
+}
+
 /// Unrouted nets must not regress.
 ///
 /// This is the gate that the placement work of phases 2 and 4 failed, and

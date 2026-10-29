@@ -74,6 +74,7 @@
 )]
 
 pub mod advisor;
+mod analytic;
 pub mod board_family;
 pub mod cem;
 pub mod floorplan;
@@ -1089,6 +1090,27 @@ pub fn place_with_tuning_and_sidecar_seeded<S: ::std::hash::BuildHasher>(
     sidecar_path: Option<&std::path::Path>,
     seed: u64,
 ) -> Result<Placement, PlaceError> {
+    place_with_tuning_and_sidecar_seeded_mode(
+        board,
+        extra_margin_mm,
+        rotation_overrides,
+        sidecar_path,
+        seed,
+        SeedMode::Cem,
+    )
+}
+
+/// The sidecar path with an explicit seed mode. `place_with_analytic_seed` and
+/// its sidecar variant use this; every existing public entry point keeps
+/// [`SeedMode::Cem`].
+fn place_with_tuning_and_sidecar_seeded_mode<S: ::std::hash::BuildHasher>(
+    board: &Board,
+    extra_margin_mm: f64,
+    rotation_overrides: &std::collections::HashMap<ComponentId, synth_geometry::Rotation, S>,
+    sidecar_path: Option<&std::path::Path>,
+    seed: u64,
+    seed_mode: SeedMode,
+) -> Result<Placement, PlaceError> {
     let has_sidecar = sidecar_path.is_some_and(std::path::Path::exists);
     let loaded = sidecar_path
         .filter(|path| path.exists())
@@ -1135,6 +1157,7 @@ pub fn place_with_tuning_and_sidecar_seeded<S: ::std::hash::BuildHasher>(
         seed,
         !has_sidecar,
         &pinned,
+        seed_mode,
     )?;
     if let Some(sidecar) = loaded.as_ref() {
         apply_sidecar_overrides(board, &mut placement, sidecar);
@@ -1150,6 +1173,45 @@ pub fn place(board: &Board) -> Result<Placement, PlaceError> {
     place_with_default_tuning(board, true)
 }
 
+/// Which global seed the target-point search starts from.
+///
+/// `Cem` is the production default. `Analytic` is the opt-in quadratic
+/// wirelength seed used by [`place_with_analytic_seed`] for the A/B against
+/// the current placer; it is not selected by [`place`] until the routed
+/// comparison proves it.
+#[derive(Clone, Copy)]
+enum SeedMode {
+    Cem,
+    Analytic,
+}
+
+/// Place with the analytical quadratic-wirelength seed.
+///
+/// Same pipeline, legaliser and visual review as [`place`]; only the target
+/// hints differ. This is the A/B entry point for the analytical seed and is
+/// not the production default.
+pub fn place_with_analytic_seed(board: &Board) -> Result<Placement, PlaceError> {
+    place_with_analytic_seed_and_sidecar(board, None)
+}
+
+/// [`place_with_analytic_seed`] with the optional PCB-placement sidecar.
+///
+/// Absolute sidecar entries are anchors for the analytical solve, exactly as
+/// they are constraints for the greedy search.
+pub fn place_with_analytic_seed_and_sidecar(
+    board: &Board,
+    sidecar_path: Option<&std::path::Path>,
+) -> Result<Placement, PlaceError> {
+    place_with_tuning_and_sidecar_seeded_mode(
+        board,
+        DEFAULT_MARGIN_MM,
+        &default_rotation_overrides(board),
+        sidecar_path,
+        0,
+        SeedMode::Analytic,
+    )
+}
+
 /// `place()` with the production defaults, optionally without compaction.
 fn place_with_default_tuning(board: &Board, compact: bool) -> Result<Placement, PlaceError> {
     place_with_tuning_impl(
@@ -1159,6 +1221,7 @@ fn place_with_default_tuning(board: &Board, compact: bool) -> Result<Placement, 
         0,
         compact,
         &PinnedPlacements::new(),
+        SeedMode::Cem,
     )
 }
 
@@ -1238,6 +1301,7 @@ pub fn place_with_dimensions(
         false,
         0,
         &PinnedPlacements::new(),
+        SeedMode::Cem,
     )?;
 
     // `place_with_outline` tightens automatic outlines after solving. For an
@@ -1369,6 +1433,7 @@ pub fn place_with_tuning_seeded<S: ::std::hash::BuildHasher>(
         seed,
         true,
         &PinnedPlacements::new(),
+        SeedMode::Cem,
     )
 }
 
@@ -1383,6 +1448,7 @@ fn place_with_tuning_impl<S: ::std::hash::BuildHasher>(
     seed: u64,
     compact: bool,
     pinned: &PinnedPlacements,
+    seed_mode: SeedMode,
 ) -> Result<Placement, PlaceError> {
     use synth_layout::pcb_courtyard_geometry_for_part;
 
@@ -1447,6 +1513,7 @@ fn place_with_tuning_impl<S: ::std::hash::BuildHasher>(
             true,
             seed,
             pinned,
+            seed_mode,
         ) {
             Ok(p) => {
                 let packed = if compact {
@@ -1853,6 +1920,7 @@ fn place_with_outline<S: ::std::hash::BuildHasher>(
     tighten_outline: bool,
     seed: u64,
     pinned: &PinnedPlacements,
+    seed_mode: SeedMode,
 ) -> Result<Placement, PlaceError> {
     use synth_geometry::nm_to_mm;
     let mut resolved_rotation_overrides: std::collections::HashMap<
@@ -2034,7 +2102,21 @@ fn place_with_outline<S: ::std::hash::BuildHasher>(
             }
         }
     }
-    let region_hints = cem::cem_region_assign(board, usable);
+    // Shared by the analytical seed and pad-aware near placement: both need
+    // the same footprint geometry the router uses.
+    let pad_offsets = build_pad_offset_lookup(board);
+    let region_hints = match seed_mode {
+        SeedMode::Cem => cem::cem_region_assign(board, usable),
+        SeedMode::Analytic => analytic::region_assign(
+            board,
+            usable,
+            &fp_targets,
+            &resolved_rotation_overrides,
+            pinned,
+            &courtyard_lookup,
+            &pad_offsets,
+        ),
+    };
 
     // Child lookup for relative module offset placement and auto-rotation
     let mut child_module_map: std::collections::HashMap<
@@ -2049,11 +2131,6 @@ fn place_with_outline<S: ::std::hash::BuildHasher>(
             );
         }
     }
-
-    // Pad-aware near placement needs the same footprint geometry used by the
-    // router. Keeping this lookup here ensures a hard-near passive targets the
-    // actual anchor pad, not just the anchor courtyard centre.
-    let pad_offsets = build_pad_offset_lookup(board);
 
     let pitch_nm = mm_to_nm(GRID_PITCH_MM);
     let center_x = usable.min.x_nm + usable.width_nm() / 2;
@@ -5289,7 +5366,7 @@ const COMPACT_PERMILLE: [i64; 3] = [900, 950, 980];
 /// Parts with at least this many pins get a wider keep-out ring, in
 /// compaction and in the wirelength pass, so the router can still escape their
 /// pins.
-const DENSE_PART_PINS: usize = 12;
+pub(crate) const DENSE_PART_PINS: usize = 12;
 
 /// Extra width and height added to a dense part's courtyard, in millimetres:
 /// half of it on each side. Compaction separates parts by it and the
@@ -5299,10 +5376,10 @@ const DENSE_PART_PINS: usize = 12;
 /// nets in the native router, and the right size is not monotonic, so
 /// re-check `sensor_logger_routes_cleanly`, `iot_sensor_board_routes_cleanly`
 /// and the `routability_report` gate before changing it.
-const DENSE_PART_RING_MM: f64 = 7.0;
+pub(crate) const DENSE_PART_RING_MM: f64 = 7.0;
 
 /// Whether a component has enough pins to need a keep-out ring.
-fn is_dense_part(board: &Board, id: ComponentId) -> bool {
+pub(crate) fn is_dense_part(board: &Board, id: ComponentId) -> bool {
     board
         .component(id)
         .and_then(|c| c.part.as_ref())
