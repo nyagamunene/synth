@@ -1501,7 +1501,7 @@ fn check(
         if let Some(dir) = registry {
             drc_args.extend(["--registry".into(), dir.display().to_string()]);
         }
-        let (drc_output, timed_out) = run_check_child(&exe, &drc_args, 30)?;
+        let (drc_output, timed_out) = run_check_child(&exe, &drc_args, 120)?;
         (
             serde_json::from_slice::<serde_json::Value>(&drc_output.stdout)
                 .unwrap_or_else(|_| serde_json::json!({"status": "unknown", "parse_error": true})),
