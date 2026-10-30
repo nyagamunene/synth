@@ -422,10 +422,12 @@ def render_vision(design, out_dir, result):
         result["vision"] = str(output)
 
 
-def score_board(synth_bin, design, out_dir, krt_repo, krt_python, registry=None):
+def score_board(
+    synth_bin, design, out_dir, krt_repo, krt_python, registry=None, router_override=None
+):
     start = time.monotonic()
     try:
-        router = router_for(design)
+        router = router_override or router_for(design)
         router_args = (
             ["--freerouting-jar", FREEROUTING_JAR, "--freerouting-java", FREEROUTING_JAVA]
             if router == "free-routing"
@@ -546,10 +548,25 @@ if __name__ == "__main__":
     reg_dir = tempfile.TemporaryDirectory(prefix="ar-shape-reg-")
     reg = merged_registry(reg_dir.name)
     for design in sys.argv[1:]:
-        with tempfile.TemporaryDirectory(prefix="ar-shape-") as out:
-            s = score_board(
-                synth, design, out, f"{home}/KiCadRoutingTools", f"{home}/krt-venv/bin/python", reg
-            )
+        preferred = router_for(design)
+        # The preferred engine is fixed per board; a hard-gate failure gets one
+        # attempt on the other engine, so a flaky router cannot block the
+        # baseline. Keep the first clean result.
+        fallback = "kicad-routing-tools" if preferred == "free-routing" else "free-routing"
+        s = None
+        for override in (None, fallback):
+            with tempfile.TemporaryDirectory(prefix="ar-shape-") as out:
+                s = score_board(
+                    synth,
+                    design,
+                    out,
+                    f"{home}/KiCadRoutingTools",
+                    f"{home}/krt-venv/bin/python",
+                    reg,
+                    router_override=override,
+                )
+            if s["ok"]:
+                break
         print(design, json.dumps(s), flush=True)
         if s["ok"]:
             total += s["score"]
