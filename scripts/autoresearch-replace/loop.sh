@@ -29,7 +29,7 @@ dbg() { printf '[%s +%s]   %s\n' "$(stamp)" "$(elapsed)" "$*" >>"$LOGDIR/loop.lo
 section() { say "===== $* ====="; }
 delta() { awk -v a="$1" -v b="$2" 'BEGIN { if (a + 0 == a) printf "%.1f (%+.1f)", a, a - b; else printf "%s", a }'; }
 log() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$LOG"; }
-revert() { git reset -q --hard HEAD && git clean -fdq -- crates; }
+revert() { git reset -q --hard HEAD && git clean -fdq -- crates fixtures examples scripts/autoresearch-replace/boards; }
 finish() {
   say "STOP: $1"
   say "summary: elapsed $(elapsed)${base_t:+ | tuning $base_t -> ${best_t:-?} | held-out $base_h -> ${best_h:-?}}"
@@ -85,10 +85,13 @@ def num(value):
 
 
 print(f"  {label}:")
-print(f"    {'board':<34} {'score':>9} {'dead':>7} {'area':>8} {'wire':>8} {'open':>5} {'drc':>4}")
+print(
+    f"    {'board':<30} {'score':>8} {'dead':>7} {'area':>8} {'wire':>8} "
+    f"{'open':>5} {'drc':>4} {'fit':>4} {'sup':>7} {'rail':>6} {'in':>6}"
+)
 for line in open(path):
     line = line.strip()
-    if not line or line.startswith(("SCORE", "WIRE")):
+    if not line or line.startswith(("SCORE", "WIRE", "FITNESS")):
         continue
     parts = line.split(" ", 1)
     if len(parts) != 2:
@@ -102,10 +105,15 @@ for line in open(path):
     if not data.get("ok"):
         print(f"    {board:<34} FAIL {str(data.get('why', ''))[:90]}")
         continue
+    def opt(value, fmt="{:.2f}"):
+        return "-" if value is None else fmt.format(value)
+
     print(
-        f"    {board:<34} {num(data.get('score')):>9.1f} {num(data.get('dead_mm2')):>7.0f} "
+        f"    {board:<30} {num(data.get('score')):>8.1f} {num(data.get('dead_mm2')):>7.0f} "
         f"{num(data.get('area_mm2')):>8.1f} {num(data.get('wire_length_mm')):>8.1f} "
-        f"{num(data.get('open')):>5} {num(data.get('errors')):>4}"
+        f"{num(data.get('open')):>5} {num(data.get('errors')):>4} "
+        f"{num(data.get('fitness_failures')):>4} {opt(data.get('support_mean'), '{:>7.2f}'):>7} "
+        f"{opt(data.get('rail_band'), '{:>6.2f}'):>6} {opt(data.get('mating_inset'), '{:>6.2f}'):>6}"
     )
 PY
 }
@@ -131,6 +139,9 @@ say "focus: $FOCUS"
 say "table: $LOG | agent: $AR | logs: $LOGDIR"
 git diff --quiet -- crates || finish "uncommitted changes under crates/, refusing to start" 1
 git add $AR && git commit -qsm "NOISSUE - replace params autoresearch harness" >/dev/null 2>&1
+if [ -f "$LOG" ] && [ "$(head -1 "$LOG" | awk -F'\t' '{print NF}')" != "9" ]; then
+  mv "$LOG" "$LOG.old.$(date +%s)"
+fi
 [ -f $LOG ] || printf 'round\tcommit\ttuning_score\theldout_score\ttuning_wire\theldout_wire\tfitness\tstatus\tnote\n' >$LOG
 
 section "baseline"
@@ -151,7 +162,7 @@ best_f=$((best_ft + best_fh))
 base_t=$best_t; base_h=$best_h; base_w=$best_w; base_hw=$best_hw; base_f=$best_f
 board_report "$LOGDIR/tuning.log" "baseline tuning"
 board_report "$LOGDIR/heldout.log" "baseline held-out"
-say "baseline: tuning $base_t (wire $base_w, fitness $base_f), held-out $base_h (wire $base_hw), elapsed $(elapsed)"
+say "baseline: tuning $base_t (wire $base_w, fitness $best_ft), held-out $base_h (wire $base_hw, fitness $best_fh), total fitness $base_f, elapsed $(elapsed)"
 log 0 "$(git rev-parse --short HEAD)" "$best_t" "$best_h" "$best_w" "$best_hw" "$best_f" baseline "start"
 
 start=$SECONDS; discards=0
@@ -160,13 +171,15 @@ for i in $(seq 1 "$MAX_EXP"); do
   [ "$discards" -lt "$MAX_DISCARDS" ] || finish "$MAX_DISCARDS discards in a row"
   r="r$i/$MAX_EXP"
   section "$r"
-  say "$r start: elapsed $(elapsed), budget left $(dur $((MAX_SECONDS - (SECONDS - start)))), best tuning $best_t / held-out $best_h / fitness $best_f, discards $discards"
+  say "$r start: elapsed $(elapsed), budget left $(dur $((MAX_SECONDS - (SECONDS - start)))), best tuning $best_t / held-out $best_h, fitness tuning $best_ft / held-out $best_fh, discards $discards"
   rm -f $NOTE
   prompt="$(sed "s|/tmp/ar-note.txt|$NOTE|g" $AR/program.md)
 
+Note path: $NOTE
+
 ${FOCUS:+Focus of this loop (stay on it unless it is exhausted): $FOCUS
 }
-Best so far: tuning $best_t, held-out $best_h, fitness gate failures $best_f.
+Best so far: tuning $best_t, held-out $best_h, fitness gate failures tuning $best_ft / held-out $best_fh (total $best_f).
 Recent rounds:
 $(tail -n 8 $LOG)"
 
@@ -201,9 +214,13 @@ $(tail -n 8 $LOG)"
   fi
   files=$(git diff --name-only -- crates | xargs -n1 basename | paste -sd, -)
   say "$r agent $adur $(git diff --numstat -- crates | awk '{a += $1; d += $2} END {printf "+%d/-%d", a, d}') [$files]"
-  if git diff --name-only | grep -Evq '^crates/(synth-place|synth-layout|synth-kicad)/src/'; then
-    say "$r REJECT touched files outside the allowed folders"
+  if git diff --name-only | grep -Evq '^crates/synth-place/src/(replace_params\.rs|replace\.rs|lib\.rs)$'; then
+    say "$r REJECT touched a frozen file (only replace_params.rs, replace.rs and the legalizer in lib.rs are allowed)"
     revert; log "$i" - - - - - "$best_f" rejected "touched frozen files"; discards=$((discards + 1)); continue
+  fi
+  if git status --porcelain | grep -Eq '^\?\? (fixtures|examples|scripts/autoresearch-replace/boards)/'; then
+    say "$r REJECT created an untracked design sidecar"
+    revert; log "$i" - - - - - "$best_f" rejected "untracked design file"; discards=$((discards + 1)); continue
   fi
   if git diff | grep -Eq '^-.*#\[test\]'; then
     say "$r REJECT removed a test"
