@@ -52,8 +52,6 @@ VISION_BOARDS = {
     for name in os.environ.get("AR_VISION_BOARDS", "secure_tracker,sensor_logger").split(",")
     if name.strip()
 }
-FITNESS_WEIGHT = 2.0
-FITNESS_GATE_WEIGHT = 50.0
 
 
 def _gr_blocks(pcb):
@@ -325,7 +323,10 @@ def gates(stdout, exit_code):
 def keep(tune, held, best_tune, best_held):
     if "FAIL" in (tune, held):
         return False
-    return tune < best_tune - 0.01 and held <= best_held
+    # One 1 mm dead cell, or half a percent on a large board, is the smallest
+    # change this metric can resolve. Anything smaller is noise.
+    threshold = max(1.0, 0.005 * best_tune)
+    return tune <= best_tune - threshold and held <= best_held
 
 
 def should_keep(
@@ -480,6 +481,8 @@ def score_board(synth_bin, design, out_dir, krt_repo, krt_python, registry=None)
             g["fitness_score"] = fitness.get("score")
             g["fitness_gate_failures"] = fitness.get("gate_failures")
             g["support_mean_mm"] = (metrics.get("support_distance") or {}).get("mean")
+            g["support_worst_mm"] = (metrics.get("support_distance") or {}).get("measured")
+            g["support_limit_mm"] = (metrics.get("support_distance") or {}).get("limit")
             g["mating_inset_mm"] = (metrics.get("mating_inset") or {}).get("measured")
             g["rail_band_ratio"] = (metrics.get("rail_band") or {}).get("measured")
             g["area_efficiency"] = (metrics.get("area_efficiency") or {}).get("measured")
@@ -489,9 +492,7 @@ def score_board(synth_bin, design, out_dir, krt_repo, krt_python, registry=None)
                 + AREA_WEIGHT * g["area_mm2"]
                 + VIOLATION_WEIGHT * len(violations)
                 + LABEL_OVERLAP_WEIGHT * g["label_overlaps"]
-                + LABEL_OFF_WEIGHT * g["labels_off_board"]
-                + FITNESS_WEIGHT * (100.0 - g["fitness_score"])
-                + FITNESS_GATE_WEIGHT * g["fitness_gate_failures"],
+                + LABEL_OFF_WEIGHT * g["labels_off_board"],
                 2,
             )
         else:

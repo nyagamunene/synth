@@ -22,24 +22,24 @@ def test_clean_candidate_passes():
 
 
 def test_more_fitness_failures_fail():
-    best = log(line("a", ok=True, fitness_failures=0, wire_length_mm=100))
-    cand = log(line("a", ok=True, fitness_failures=1, wire_length_mm=100))
+    best = log(line("a", ok=True, fitness_gate_failures=0, wire_length_mm=100))
+    cand = log(line("a", ok=True, fitness_gate_failures=1, wire_length_mm=100))
     assert gate_boards.compare(gate_boards.load(cand), gate_boards.load(best))
 
 
 def test_more_wire_fails():
-    best = log(line("a", ok=True, wire_length_mm=100))
-    cand = log(line("a", ok=True, wire_length_mm=103))
+    best = log(line("a", ok=True, wire_length_mm=100, fitness_gate_failures=0))
+    cand = log(line("a", ok=True, wire_length_mm=103, fitness_gate_failures=0))
     assert gate_boards.compare(gate_boards.load(cand), gate_boards.load(best))
 
 
 def test_missing_or_failed_board_fails_closed():
-    best = log(line("a", ok=True, wire_length_mm=100))
+    best = log(line("a", ok=True, wire_length_mm=100, fitness_gate_failures=0))
     cand = log(line("a", ok=False, wire_length_mm=None))
     assert gate_boards.compare(gate_boards.load(cand), gate_boards.load(best))
 
 
 def test_zero_baseline_wire_is_not_gated():
-    best = log(line("a", ok=True, wire_length_mm=0))
-    cand = log(line("a", ok=True, wire_length_mm=50))
+    best = log(line("a", ok=True, wire_length_mm=0, fitness_gate_failures=0))
+    cand = log(line("a", ok=True, wire_length_mm=50, fitness_gate_failures=0))
     assert gate_boards.compare(gate_boards.load(cand), gate_boards.load(best)) == []

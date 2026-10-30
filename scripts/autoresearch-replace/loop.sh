@@ -11,6 +11,7 @@ MAX_SECONDS=${MAX_SECONDS:-28800}
 MAX_DISCARDS=${MAX_DISCARDS:-10}
 HEARTBEAT=${HEARTBEAT:-60}
 AR=scripts/autoresearch-replace
+GATE=$AR/gate_boards.py
 export AR_PLACE_REPLACE=1
 
 LOG=results-replace.tsv
@@ -33,7 +34,7 @@ dbg() { printf '[%s +%s]   %s\n' "$(stamp)" "$(elapsed)" "$*" >>"$LOGDIR/loop.lo
 section() { say "===== $* ====="; }
 delta() { awk -v a="$1" -v b="$2" 'BEGIN { if (a + 0 == a) printf "%.1f (%+.1f)", a, a - b; else printf "%s", a }'; }
 log() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$LOG"; }
-revert() { git reset -q --hard HEAD && git clean -fdq -- crates; }
+revert() { git reset -q --hard HEAD && git clean -fdq -- crates fixtures examples scripts/autoresearch-replace/boards; }
 vision_promote() {
   local source=$1
   mkdir -p "$BEST_VISION"
@@ -143,6 +144,9 @@ say "focus: $FOCUS"
 say "table: $LOG | agent: $AR | logs: $LOGDIR"
 git diff --quiet -- crates || finish "uncommitted changes under crates/, refusing to start" 1
 git add $AR && git commit -qsm "NOISSUE - replace params autoresearch harness" >/dev/null 2>&1
+if [ -f "$LOG" ] && [ "$(head -1 "$LOG" | awk -F'\t' '{print NF}')" != "10" ]; then
+  mv "$LOG" "$LOG.old.$(date +%s)"
+fi
 [ -f $LOG ] || printf 'round\tcommit\ttuning_score\theldout_score\ttuning_wire\theldout_wire\ttuning_gates\theldout_gates\tstatus\tnote\n' >$LOG
 
 section "baseline"
@@ -219,21 +223,25 @@ $(tail -n 8 $LOG)"
 
   if git diff --quiet -- crates; then
     say "$r NOOP agent $adur, no edit${note:+ ($note)}"
-    log "$i" - - - - - noop "${note:-no change}"; discards=$((discards + 1)); continue
+    log "$i" - - - - - - - noop "${note:-no change}"; discards=$((discards + 1)); continue
   fi
   files=$(git diff --name-only -- crates | xargs -n1 basename | paste -sd, -)
   say "$r agent $adur $(git diff --numstat -- crates | awk '{a += $1; d += $2} END {printf "+%d/-%d", a, d}') [$files]"
-  if git diff --name-only | grep -Evq '^crates/(synth-place|synth-layout|synth-kicad)/src/'; then
-    say "$r REJECT touched files outside the allowed folders"
-    revert; log "$i" - - - - - rejected "touched frozen files"; discards=$((discards + 1)); continue
+  if git diff --name-only | grep -Evq '^crates/synth-place/src/(replace_params\.rs|replace\.rs|lib\.rs)$'; then
+    say "$r REJECT touched a frozen file (only replace_params.rs, replace.rs and the legalizer in lib.rs are allowed)"
+    revert; log "$i" - - - - - - - rejected "touched frozen files"; discards=$((discards + 1)); continue
+  fi
+  if git status --porcelain | grep -Eq '^\?\? (fixtures|examples|scripts/autoresearch-replace/boards)/'; then
+    say "$r REJECT created an untracked design sidecar"
+    revert; log "$i" - - - - - - - rejected "untracked design file"; discards=$((discards + 1)); continue
   fi
   if git diff | grep -Eq '^-.*#\[test\]'; then
     say "$r REJECT removed a test"
-    revert; log "$i" - - - - - rejected "removed a test"; discards=$((discards + 1)); continue
+    revert; log "$i" - - - - - - - rejected "removed a test"; discards=$((discards + 1)); continue
   fi
   say "$r building"
   if ! build; then
-    revert; log "$i" - - - - - crash "build failed: $note"; discards=$((discards + 1)); continue
+    revert; log "$i" - - - - - - - crash "build failed: $note"; discards=$((discards + 1)); continue
   fi
 
   say "$r scoring ($(wc -l <$AR/corpus_tuning.txt) tuning + $(wc -l <$AR/corpus_heldout.txt) held-out boards)"
@@ -243,20 +251,41 @@ $(tail -n 8 $LOG)"
   gt=$(gates_total $AR/corpus_tuning.txt tuning "tuning-$i"); gh=$(gates_total $AR/corpus_heldout.txt heldout "heldout-$i")
   board_report "$LOGDIR/tuning-$i.log" "$r tuning"
   board_report "$LOGDIR/heldout-$i.log" "$r held-out"
+  gate_msg=$(python3 "$GATE" "$LOGDIR/tuning-$i.log" "$LOGDIR/tuning.log" "$LOGDIR/heldout-$i.log" "$LOGDIR/heldout.log" 2>&1)
+  if [ $? -ne 0 ]; then
+    say "$r REJECT per-board gate:"
+    printf '%s
+' "$gate_msg" | tee -a "$LOGDIR/loop.log" >&2
+    revert; log "$i" - "$t" "$h" "$w_t" "$w_h" "$gt" "$gh" rejected "per-board gate"
+    discards=$((discards + 1)); continue
+  fi
   failed=$(grep -h '"ok": false' $LOGDIR/tuning-$i.log $LOGDIR/heldout-$i.log | awk '{n = split($1, a, "/"); printf "%s ", a[n]}')
   lognote="$note${failed:+ [failed: $failed]}"
   dt=$(delta "$t" "$best_t"); dh=$(delta "$h" "$best_h")
-  if python3 -c "import sys; sys.path.insert(0,'$AR'); import score; sys.exit(0 if score.should_keep(*sys.argv[1:13]) else 1)" "$t" "$h" "$best_t" "$best_h" "$w_t" "$w_h" "$best_w" "$best_hw" "$gt" "$gh" "$best_gates_t" "$best_gates_h"; then
+  if python3 -c "import sys; sys.path.insert(0,'$AR'); import score; sys.exit(0 if score.should_keep(*sys.argv[1:13]) else 1)" "$t" "$h" "$best_t" "$best_h" "$w_t" "$w_h" "$base_w" "$base_hw" "$gt" "$gh" "$best_gates_t" "$best_gates_h"; then
     git add -A crates && git commit -qsm "NOISSUE - replace params research round $i: ${lognote:-change}"
     c=$(git rev-parse --short HEAD)
     vision_promote "$AR_VISION_DIR"
     say "$r KEEP tuning $dt | held-out $dh | wire $w_t/$w_h | gates $gt/$gh | commit $c | elapsed $(elapsed) | ${note:0:70}"
     log "$i" "$c" "$t" "$h" "$w_t" "$w_h" "$gt" "$gh" keep "$lognote"
     best_t=$t; best_h=$h; best_w=$w_t; best_hw=$w_h; best_gates_t=$gt; best_gates_h=$gh; discards=0
+    cp "$LOGDIR/tuning-$i.log" "$LOGDIR/tuning.log"
+    cp "$LOGDIR/heldout-$i.log" "$LOGDIR/heldout.log"
   else
     revert; discards=$((discards + 1))
     say "$r DISCARD tuning $dt | held-out $dh | wire $w_t/$w_h | gates $gt/$gh${failed:+ | failed: $failed} | elapsed $(elapsed) | ${note:0:60}"
     log "$i" - "$t" "$h" "$w_t" "$w_h" "$gt" "$gh" discard "$lognote"
   fi
 done
+
+section "test"
+say "test: scoring the unseen corpus once"
+test_score=$(total $AR/corpus_test.txt test)
+test_wire=$(wire_total $AR/corpus_test.txt test)
+test_gates=$(gates_total $AR/corpus_test.txt test)
+say "TEST score $test_score wire $test_wire gates $test_gates"
+say "fitness debt: tuning $best_gates_t / held-out $best_gates_h"
+if [ "${REQUIRE_CLEAN:-0}" = "1" ] && [ $((best_gates_t + best_gates_h)) -gt 0 ]; then
+  finish "fitness debt remains" 1
+fi
 finish "reached $MAX_EXP rounds"

@@ -11,8 +11,11 @@ The score is
             + 50 * label_overlaps + 100 * labels_off_board
 
 summed over the tuning corpus; lower is better. Every board must export with
-0 open nets, 0 KiCad DRC errors and 0 unconnected pads. A keep also requires
-routed wire length not to grow by more than 2% on either corpus.
+0 open nets, 0 KiCad DRC errors and 0 unconnected pads. A keep also requires a
+tuning drop of at least one 1 mm dead cell (or 0.5 %, whichever is larger),
+routed wire within +2 % of the baseline, and no per-board rise in fitness
+failures, wire or support distance. `irrigation_controller` is a test board
+scored once at the end; never tune against it.
 
 ## What you do each round
 
@@ -71,17 +74,16 @@ rounds that failed a board name it in the results ("failed:"); fix that cause.
 
 ## Electrical fitness and vision
 
-The scorer now writes `*.fitness.json` (PR #400) and adds a fitness term to the
-score:
+The scorer writes `*.fitness.json` (PR #400) and prints `fit` and `gate` in the
+per-board table. Fitness is a **gate**, not a score term: the 0-100 composite
+is never added to the objective. `gate_boards.py` compares every board with the
+last kept run; a rise in failures, routed wire or support distance rejects the
+round even if another board improves. The full report (support distance, rail
+band, mating inset, area efficiency, assumptions) is available through the MCP
+`synth_describe_placement` tool.
 
-    score = dead_mm2 + 0.25 * area_mm2 + penalties
-          + 2 * (100 - fitness_score) + 50 * fitness_gate_failures
-
-`fitness_score` is the 0-100 composite; higher is better. The per-board table
-shows `fit` and `gate`; the full report (support distance, rail band, mating
-inset, area efficiency, assumptions) is available through the MCP
-`synth_describe_placement` tool. The keep rule also requires the gate-failure
-total not to increase.
+`env_logger` and the `boards/` canaries are sidecar-pinned and excluded from
+the placer corpora: a sidecar means the placer is not under test.
 
 The driver attaches the current best placement image(s) to your prompt. Look at
 the dead space and the cluster placement, then make one targeted change. The

@@ -8,7 +8,8 @@ Usage:
     gate_boards.py CAND_TUNING BEST_TUNING CAND_HELD BEST_HELD
 
 Prints one line per failed board and exits 1. A missing or failed board fails
-closed.
+closed. Both the post-fix field names (`fitness_gate_failures`,
+`support_mean_mm`) and the older ones are accepted.
 """
 import json
 import sys
@@ -22,7 +23,7 @@ def load(path):
     boards = {}
     for line in open(path):
         line = line.strip()
-        if not line or line.startswith(("SCORE", "WIRE", "FITNESS", "TEST")):
+        if not line or line.startswith(("SCORE", "WIRE", "GATES", "FITNESS", "TEST")):
             continue
         parts = line.split(" ", 1)
         if len(parts) != 2:
@@ -32,6 +33,20 @@ def load(path):
         except ValueError:
             continue
     return boards
+
+
+def field(board, *names):
+    for name in names:
+        if name in board:
+            return board[name]
+    return None
+
+
+def failures(board):
+    value = field(board, "fitness_gate_failures", "fitness_failures")
+    if value is None:
+        value = (board.get("fitness") or {}).get("gate_failures")
+    return value
 
 
 def compare(candidate, best):
@@ -45,34 +60,34 @@ def compare(candidate, best):
             problems.append(f"{board}: not clean ({after.get('why', 'no reason')})")
             continue
 
-        failures_before = before.get("fitness_failures") or 0
-        failures_after = after.get("fitness_failures") or 0
-        if failures_after > failures_before:
+        before_failures = failures(before)
+        after_failures = failures(after)
+        if before_failures is None or after_failures is None:
+            problems.append(f"{board}: fitness failures missing")
+        elif after_failures > before_failures:
             problems.append(
-                f"{board}: fitness failures {failures_before} -> {failures_after}"
+                f"{board}: fitness failures {before_failures} -> {after_failures}"
             )
 
-        wire_before = before.get("wire_length_mm") or 0
-        wire_after = after.get("wire_length_mm") or 0
-        if wire_before > 0 and wire_after > wire_before * (1 + WIRE_GROWTH):
-            problems.append(
-                f"{board}: wire {wire_before:.1f} -> {wire_after:.1f} mm"
-            )
+        before_wire = before.get("wire_length_mm") or 0
+        after_wire = after.get("wire_length_mm") or 0
+        if before_wire > 0 and after_wire > before_wire * (1 + WIRE_GROWTH):
+            problems.append(f"{board}: wire {before_wire:.1f} -> {after_wire:.1f} mm")
 
-        for key, tolerance in (
-            ("support_mean", SUPPORT_GROWTH_MM),
-            ("support_worst", SUPPORT_GROWTH_MM),
+        for names, key in (
+            (("support_mean", "support_mean_mm"), "support mean"),
+            (("support_worst", "support_worst_mm"), "support worst"),
         ):
-            before_value = before.get(key)
-            after_value = after.get(key)
-            if before_value is None or after_value is None:
+            before_support = field(before, *names)
+            after_support = field(after, *names)
+            if before_support is None or after_support is None:
                 continue
-            allowed = before_value + max(
-                tolerance, SUPPORT_GROWTH_FRACTION * before_value
+            allowed = before_support + max(
+                SUPPORT_GROWTH_MM, SUPPORT_GROWTH_FRACTION * before_support
             )
-            if after_value > allowed:
+            if after_support > allowed:
                 problems.append(
-                    f"{board}: {key} {before_value:.2f} -> {after_value:.2f} mm"
+                    f"{board}: {key} {before_support:.2f} -> {after_support:.2f} mm"
                 )
     return problems
 

@@ -8,19 +8,20 @@ with hard routing gates and a 2% wire cap.
 
     dead_mm2 + 0.25 * area_mm2 + 200 * connector_violations
             + 50 * label_overlaps + 100 * labels_off_board
-            + 2 * (100 - fitness_score) + 50 * fitness_gate_failures
 
-Lower is better. `fitness_score` is PR #400's 0-100 electrical composite
-(higher is better); `fitness_gate_failures` is its count of support, rail and
-mating failures. A keep requires a tuning drop, no held-out growth, routed wire
-length within +2%, and no increase in the gate-failure total.
+Lower is better. Fitness is a gate, not a score term: the 0-100 composite is
+never summed into the objective. A keep requires a tuning drop of at least one
+1 mm dead cell (or 0.5 %, whichever is larger), no held-out growth, routed wire
+within +2 % of the baseline, and no per-board rise in fitness failures, wire or
+support distance.
 
 ## Electrical fitness and vision
 
 `SYNTH_EXPORT_FITNESS=1` makes the exporter write `<stem>.fitness.json` for
 the placement it used. The scorer reads it and prints `fit/gate/sup/mat` in the
-per-board table. The full report is available to the agent through the MCP
-`synth_describe_placement` tool.
+per-board table. `gate_boards.py` compares each board with the last kept run and
+rejects a rise in failures, wire or support distance. The full report is
+available through the MCP `synth_describe_placement` tool.
 
 The scorer renders the un-routed placement for `AR_VISION_BOARDS`
 (default `secure_tracker,sensor_logger`) into `AR_VISION_DIR`. The driver keeps
@@ -39,9 +40,12 @@ frozen.
 
 ## Corpus
 
-- Tuning: `secure_tracker`, `sensor_logger`, `env_logger`, `decoupling_heavy`,
+- Tuning: `secure_tracker`, `sensor_logger`, `decoupling_heavy`,
   `iot_sensor_board`.
 - Held-out: `ldo_block`, `divider`, `mcu`, `placement_and_diff_pair`.
+- Test (scored once at the end): `irrigation_controller`.
+- Sidecar-pinned: `env_logger` is excluded; a sidecar means the placer is not
+  the thing under test.
 
 `secure_tracker` and `iot_sensor_board` are the hard cases: large interior dead
 space and connector-bound outlines. `feather` is excluded: two pre-existing DRC
