@@ -6107,9 +6107,453 @@ fn compact_placement(board: &Board, placement: Placement) -> Placement {
     current
 }
 
-/// Nets with more pins than this are power rails or buses. They are
-/// routed as pours or trunks, so pulling parts toward their middle only
-/// scatters everything else.
+/// Move passives into under-occupied interior bins, then squeeze the passive
+/// band vertically. Opt-in experiment; [`place`] and the export path do not
+/// call it.
+///
+/// The pass never moves connectors, hinted parts, sidecar pins, keepout
+/// anchors, board features or non-passives. It keeps the dense-part ring and
+/// guards every move with total HPWL and a per-net centroid distance, so a
+/// decoupling cap cannot leave its IC just because the total HPWL is unchanged.
+#[allow(clippy::implicit_hasher)]
+pub fn repack_interior(
+    board: &Board,
+    mut placement: Placement,
+    frozen: &std::collections::HashSet<ComponentId>,
+) -> Placement {
+    let original = placement.clone();
+    let sizes = courtyard_sizes(board, &placement);
+    let spaced: Vec<(f64, f64)> = placement
+        .components
+        .iter()
+        .zip(&sizes)
+        .map(|(placed, &(width, height))| {
+            if is_dense_part(board, placed.id) {
+                (width + DENSE_PART_RING_MM, height + DENSE_PART_RING_MM)
+            } else {
+                (width, height)
+            }
+        })
+        .collect();
+    let anchors = repack_anchors(board);
+    let movable: Vec<bool> = placement
+        .components
+        .iter()
+        .map(|placed| {
+            board.component(placed.id).is_some_and(|component| {
+                is_passive(component)
+                    && !frozen.contains(&placed.id)
+                    && !repack_hinted(component)
+                    && !is_edge_flush_connector(component)
+                    && !synth_layout::is_board_feature_kind(&component.kind)
+                    && !anchors.contains(&placed.id)
+            })
+        })
+        .collect();
+    if !movable.iter().any(|&free| free) {
+        return original;
+    }
+    let Some(envelope) = non_connector_envelope(board, &placement, &sizes) else {
+        return original;
+    };
+    let bins = repack_bins(&placement, &spaced, envelope);
+    let baseline_hpwl = total_hpwl_nm(board, &placement);
+    let baseline_hits = keepout_hits(board, &placement);
+    let baseline_labels = labels_without_room(board, &placement, &sizes);
+
+    let mut order: Vec<usize> = (0..placement.components.len())
+        .filter(|&index| movable[index])
+        .collect();
+    order.sort_by(|&left, &right| {
+        let area = |index: usize| sizes[index].0 * sizes[index].1;
+        area(right)
+            .partial_cmp(&area(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                placement.components[left]
+                    .id
+                    .cmp(&placement.components[right].id)
+            })
+    });
+
+    let pitch_nm = mm_to_nm(0.5);
+    let radius_nm = mm_to_nm(REPACK_RADIUS_MM);
+    for index in order {
+        let placed = &placement.components[index];
+        let centroid = net_centroid(board, &placement, placed.id).unwrap_or(placed.center);
+        let mut candidates: Vec<(i128, i128, usize, Point)> = bins
+            .iter()
+            .enumerate()
+            .filter(|(_, bin)| bin.under_occupied)
+            .filter_map(|(bin_index, bin)| {
+                let center = Point::new(
+                    (bin.rect.min.x_nm + bin.rect.max.x_nm) / 2,
+                    (bin.rect.min.y_nm + bin.rect.max.y_nm) / 2,
+                );
+                let dx = center.x_nm - placed.center.x_nm;
+                let dy = center.y_nm - placed.center.y_nm;
+                if dx.abs() > radius_nm || dy.abs() > radius_nm {
+                    return None;
+                }
+                let to_centroid = squared_distance(center, centroid);
+                let to_current = squared_distance(center, placed.center);
+                Some((to_centroid, to_current, bin_index, center))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(to_centroid, to_current, bin_index, _)| {
+            (to_centroid, to_current, bin_index)
+        });
+        for (_, _, _, mut center) in candidates.into_iter().take(REPACK_CANDIDATES) {
+            center.x_nm = snap_nm(center.x_nm, pitch_nm);
+            center.y_nm = snap_nm(center.y_nm, pitch_nm);
+            if !repack_candidate_legal(board, &placement, index, center, &spaced, envelope) {
+                continue;
+            }
+            let mut trial = placement.clone();
+            trial.components[index].center = center;
+            if total_hpwl_nm(board, &trial) > baseline_hpwl
+                || !net_centroids_do_not_grow(board, &placement, &trial, placed.id)
+            {
+                continue;
+            }
+            placement = trial;
+            break;
+        }
+    }
+
+    if placement == original
+        || total_hpwl_nm(board, &placement) > baseline_hpwl
+        || keepout_hits(board, &placement) > baseline_hits
+        || labels_without_room(board, &placement, &sizes) > baseline_labels
+    {
+        return original;
+    }
+    let mut candidate = keep_unless_worse(board, original.clone(), placement);
+    candidate = squeeze_passive_band(board, candidate, &sizes, &spaced, &movable);
+    keep_unless_worse(board, original, candidate)
+}
+
+/// A hinted part is the author's decision; a soft hint is still a hint.
+fn repack_hinted(component: &synth_ir::Component) -> bool {
+    component.placement_hint.is_some()
+}
+
+/// Anchors a passive move must not disturb: the target of a relative hint and
+/// the part a keepout circle is attached to.
+fn repack_anchors(board: &Board) -> std::collections::HashSet<ComponentId> {
+    let mut anchors = std::collections::HashSet::new();
+    for component in &board.components {
+        if let Some(near) = component
+            .placement_hint
+            .as_ref()
+            .and_then(|hint| hint.near.as_deref())
+        {
+            if let Some(anchor) = board
+                .components
+                .iter()
+                .find(|candidate| candidate.refdes.eq_ignore_ascii_case(near))
+            {
+                anchors.insert(anchor.id);
+            }
+        }
+    }
+    for keepout in &board.keepouts {
+        let name = keepout.name.to_lowercase();
+        if let Some(anchor) = board.components.iter().find(|component| {
+            component.refdes.to_lowercase() == name
+                || component.kind.to_lowercase() == name
+                || component.refdes.to_lowercase().starts_with(&name)
+        }) {
+            anchors.insert(anchor.id);
+        }
+    }
+    anchors
+}
+
+fn snap_nm(value: i64, pitch: i64) -> i64 {
+    (value + pitch / 2).div_euclid(pitch) * pitch
+}
+
+/// Bins of [`REPACK_BIN_MM`] over the non-connector envelope, with the
+/// courtyard coverage that decides whether a bin has room.
+struct RepackBin {
+    rect: Rect,
+    under_occupied: bool,
+}
+
+const REPACK_BIN_MM: f64 = 2.0;
+const REPACK_RADIUS_MM: f64 = 15.0;
+const REPACK_CANDIDATES: usize = 8;
+const REPACK_UNDER_OCCUPIED_PERMILLE: i64 = 250;
+
+fn repack_bins(placement: &Placement, spaced: &[(f64, f64)], envelope: Rect) -> Vec<RepackBin> {
+    let bin_nm = mm_to_nm(REPACK_BIN_MM);
+    let cols = (envelope.width_nm().max(1) / bin_nm).clamp(1, 128);
+    let rows = (envelope.height_nm().max(1) / bin_nm).clamp(1, 128);
+    let mut bins = Vec::with_capacity(usize::try_from(cols * rows).unwrap_or(0));
+    for row in 0..rows {
+        for col in 0..cols {
+            let rect = Rect::new(
+                Point::new(
+                    envelope.min.x_nm + col * bin_nm,
+                    envelope.min.y_nm + row * bin_nm,
+                ),
+                Point::new(
+                    (envelope.min.x_nm + (col + 1) * bin_nm).min(envelope.max.x_nm),
+                    (envelope.min.y_nm + (row + 1) * bin_nm).min(envelope.max.y_nm),
+                ),
+            );
+            let covered: i64 = placement
+                .components
+                .iter()
+                .zip(spaced)
+                .map(|(placed, size)| {
+                    intersection_area(rect, rotated_courtyard_rect(placed, *size))
+                })
+                .sum();
+            let capacity = rect.width_nm().saturating_mul(rect.height_nm());
+            let under_occupied = covered.saturating_mul(1000)
+                < capacity.saturating_mul(REPACK_UNDER_OCCUPIED_PERMILLE);
+            bins.push(RepackBin {
+                rect,
+                under_occupied,
+            });
+        }
+    }
+    bins
+}
+
+fn intersection_area(left: Rect, right: Rect) -> i64 {
+    let width = (left.max.x_nm.min(right.max.x_nm) - left.min.x_nm.max(right.min.x_nm)).max(0);
+    let height = (left.max.y_nm.min(right.max.y_nm) - left.min.y_nm.max(right.min.y_nm)).max(0);
+    width.saturating_mul(height)
+}
+
+fn non_connector_envelope(
+    board: &Board,
+    placement: &Placement,
+    sizes: &[(f64, f64)],
+) -> Option<Rect> {
+    placement
+        .components
+        .iter()
+        .zip(sizes)
+        .filter(|(placed, _)| {
+            board.component(placed.id).is_some_and(|component| {
+                !matches!(component.kind.as_str(), "connector" | "jack")
+                    && !synth_layout::is_board_feature_kind(&component.kind)
+            })
+        })
+        .map(|(placed, size)| rotated_courtyard_rect(placed, *size))
+        .reduce(union_rects)
+}
+
+fn union_rects(left: Rect, right: Rect) -> Rect {
+    Rect::new(
+        Point::new(
+            left.min.x_nm.min(right.min.x_nm),
+            left.min.y_nm.min(right.min.y_nm),
+        ),
+        Point::new(
+            left.max.x_nm.max(right.max.x_nm),
+            left.max.y_nm.max(right.max.y_nm),
+        ),
+    )
+}
+
+fn squared_distance(left: Point, right: Point) -> i128 {
+    let dx = i128::from(left.x_nm - right.x_nm);
+    let dy = i128::from(left.y_nm - right.y_nm);
+    dx * dx + dy * dy
+}
+
+/// The centroid of the other endpoints on one net, or `None` for a netless
+/// part.
+fn net_centroid(board: &Board, placement: &Placement, id: ComponentId) -> Option<Point> {
+    let mut sum_x = 0_i128;
+    let mut sum_y = 0_i128;
+    let mut count = 0_i128;
+    for net in &board.nets {
+        if !net
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.component == id)
+        {
+            continue;
+        }
+        for endpoint in &net.endpoints {
+            if endpoint.component == id {
+                continue;
+            }
+            if let Some(placed) = placement
+                .components
+                .iter()
+                .find(|placed| placed.id == endpoint.component)
+            {
+                sum_x += i128::from(placed.center.x_nm);
+                sum_y += i128::from(placed.center.y_nm);
+                count += 1;
+            }
+        }
+    }
+    (count > 0).then(|| Point::new((sum_x / count) as i64, (sum_y / count) as i64))
+}
+
+/// Every net the part belongs to must not pull the part farther from that
+/// net's other endpoints. This is the power-net guard the coarse HPWL misses.
+fn net_centroids_do_not_grow(
+    board: &Board,
+    before: &Placement,
+    after: &Placement,
+    id: ComponentId,
+) -> bool {
+    let old = before.components.iter().find(|placed| placed.id == id);
+    let new = after.components.iter().find(|placed| placed.id == id);
+    let (Some(old), Some(new)) = (old, new) else {
+        return true;
+    };
+    for net in &board.nets {
+        if !net
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.component == id)
+        {
+            continue;
+        }
+        let others: Vec<Point> = net
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.component != id)
+            .filter_map(|endpoint| {
+                before
+                    .components
+                    .iter()
+                    .find(|placed| placed.id == endpoint.component)
+                    .map(|placed| placed.center)
+            })
+            .collect();
+        if others.is_empty() {
+            continue;
+        }
+        let sum_x: i128 = others.iter().map(|point| i128::from(point.x_nm)).sum();
+        let sum_y: i128 = others.iter().map(|point| i128::from(point.y_nm)).sum();
+        let centroid = Point::new(
+            (sum_x / others.len() as i128) as i64,
+            (sum_y / others.len() as i128) as i64,
+        );
+        if squared_distance(new.center, centroid) > squared_distance(old.center, centroid) {
+            return false;
+        }
+    }
+    true
+}
+
+fn repack_candidate_legal(
+    board: &Board,
+    placement: &Placement,
+    index: usize,
+    center: Point,
+    spaced: &[(f64, f64)],
+    usable: Rect,
+) -> bool {
+    let placed = &placement.components[index];
+    let Some(component) = board.component(placed.id) else {
+        return false;
+    };
+    let candidate = ComponentPlacement { center, ..*placed };
+    let rect = rotated_courtyard_rect(&candidate, spaced[index]);
+    let inset = courtyard_edge_inset_nm(component);
+    if rect.min.x_nm < usable.min.x_nm + inset
+        || rect.min.y_nm < usable.min.y_nm + inset
+        || rect.max.x_nm > usable.max.x_nm - inset
+        || rect.max.y_nm > usable.max.y_nm - inset
+    {
+        return false;
+    }
+    for (other_index, other) in placement.components.iter().enumerate() {
+        if other_index == index {
+            continue;
+        }
+        if rect.intersects(&rotated_courtyard_rect(other, spaced[other_index])) {
+            return false;
+        }
+    }
+    let lookup = |id: ComponentId| {
+        placement
+            .components
+            .iter()
+            .zip(spaced)
+            .find(|(placed, _)| placed.id == id)
+            .map(|(placed, size)| rotated_courtyard_rect(placed, *size))
+    };
+    let corners = [
+        center,
+        Point::new(rect.min.x_nm, rect.min.y_nm),
+        Point::new(rect.min.x_nm, rect.max.y_nm),
+        Point::new(rect.max.x_nm, rect.min.y_nm),
+        Point::new(rect.max.x_nm, rect.max.y_nm),
+    ];
+    !corners.iter().any(|point| {
+        #[allow(clippy::needless_borrows_for_generic_args)]
+        intersects_keepout(Rect::new(*point, *point), placed.id, board, usable, &lookup)
+    })
+}
+
+/// Scale the passive band toward its vertical middle, then separate overlaps.
+/// Only passives move; the caller keeps the result only if the envelope and
+/// the guards improve.
+fn squeeze_passive_band(
+    board: &Board,
+    placement: Placement,
+    sizes: &[(f64, f64)],
+    spaced: &[(f64, f64)],
+    movable: &[bool],
+) -> Placement {
+    let Some(envelope) = non_connector_envelope(board, &placement, sizes) else {
+        return placement;
+    };
+    let middle_y = (envelope.min.y_nm + envelope.max.y_nm) / 2;
+    let baseline_hpwl = total_hpwl_nm(board, &placement);
+    let baseline_hits = keepout_hits(board, &placement);
+    let baseline_labels = labels_without_room(board, &placement, sizes);
+    let frozen: Vec<bool> = movable.iter().map(|&free| !free).collect();
+    let pitch_nm = mm_to_nm(0.5);
+    let mut best = placement;
+    let mut best_height = envelope.height_nm();
+    for permille in [950_i64, 900, 850, 800] {
+        let mut trial = best.clone();
+        for (index, placed) in trial.components.iter_mut().enumerate() {
+            if !movable[index] {
+                continue;
+            }
+            let scaled = middle_y + (placed.center.y_nm - middle_y) * permille / 1000;
+            placed.center.y_nm = snap_nm(scaled, pitch_nm);
+        }
+        if !separate_overlaps(&mut trial, spaced, &frozen) {
+            continue;
+        }
+        let Some(candidate_envelope) = non_connector_envelope(board, &trial, sizes) else {
+            continue;
+        };
+        if candidate_envelope.height_nm() >= best_height
+            || total_hpwl_nm(board, &trial) > baseline_hpwl
+            || keepout_hits(board, &trial) > baseline_hits
+            || labels_without_room(board, &trial, sizes) > baseline_labels
+        {
+            continue;
+        }
+        let accepted = keep_unless_worse(board, best.clone(), trial);
+        if accepted != best {
+            best_height = candidate_envelope.height_nm();
+            best = accepted;
+        }
+    }
+    best
+}
+
+/// Nets with more pins than this are power rails or buses. They are routed as
+/// pours or trunks, so pulling parts toward their middle only scatters
+/// everything else.
 const HPWL_MAX_NET_MEMBERS: usize = 6;
 
 /// Wirelength passes `shorten_wires` may spend.
@@ -8874,5 +9318,67 @@ board "features_only" {
                 );
             }
         }
+    }
+
+    #[test]
+    fn interior_repack_is_deterministic_and_legal() {
+        let board = load_board("../../fixtures/designs/secure_tracker.synth");
+        let placement = place(&board).expect("place");
+        let frozen = std::collections::HashSet::new();
+        let first = repack_interior(&board, placement.clone(), &frozen);
+        let second = repack_interior(&board, placement, &frozen);
+        assert_eq!(first, second, "repeated repack must be identical");
+        let rects = authoritative_courtyards(&board, &first);
+        for left in 0..rects.len() {
+            for right in (left + 1)..rects.len() {
+                assert!(
+                    !rects[left].intersects(&rects[right]),
+                    "repack overlapped {:?} and {:?}",
+                    first.components[left].id,
+                    first.components[right].id
+                );
+            }
+        }
+        assert!(
+            !describe_placement(&board, &first)
+                .visual_review
+                .requires_revision,
+            "repack must not introduce a visual finding"
+        );
+    }
+
+    #[test]
+    fn interior_repack_keeps_hinted_passives_fixed() {
+        let source = r#"
+            board "repack" {
+              layers 2
+              component J1: connector "header_1x3"
+              component R1: resistor "r_generic_0603" value "1k" { placement_hint { region: top_left priority: hard } }
+              component R2: resistor "r_generic_0603" value "1k"
+              connect J1.p1 -> R1.p1
+              connect R1.p2 -> R2.p1
+            }
+        "#;
+        let board = board_from_source(source, "repack_hint.synth");
+        let placement = place(&board).expect("place");
+        let frozen = std::collections::HashSet::new();
+        let repacked = repack_interior(&board, placement.clone(), &frozen);
+        let centre = |candidate: &Placement, refdes: &str| {
+            candidate
+                .components
+                .iter()
+                .find(|placed| {
+                    board
+                        .component(placed.id)
+                        .is_some_and(|component| component.refdes == refdes)
+                })
+                .expect("component placed")
+                .center
+        };
+        assert_eq!(
+            centre(&placement, "R1"),
+            centre(&repacked, "R1"),
+            "a hinted passive must not move"
+        );
     }
 }

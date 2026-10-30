@@ -273,6 +273,46 @@ pub fn placement_candidates(
     Ok(candidates)
 }
 
+/// Placements after the interior repack pass, for the route A/B only.
+///
+/// Not used by the export path. The pass is experimental until the four-board
+/// route A/B shows unrouted nets do not regress.
+///
+/// # Errors
+/// [`ExportError::Placement`] when the placer finds no legal placement.
+pub fn repacked_placement_candidates(
+    board: &Board,
+    sidecars: &Sidecars,
+) -> Result<Vec<synth_place::Placement>, ExportError> {
+    let frozen: std::collections::HashSet<synth_ir::ComponentId> = sidecars
+        .placement_path()
+        .filter(|path| path.exists())
+        .and_then(synth_layout::sidecar::SidecarLayout::load_from_file)
+        .map(|sidecar| {
+            board
+                .components
+                .iter()
+                .filter(|component| sidecar.components.contains_key(&component.refdes))
+                .map(|component| component.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let candidates = placement_candidates(board, sidecars)?;
+    let mut repacked = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let mut candidate = synth_place::repack_interior(board, candidate, &frozen);
+        synth_place::fit_outline_with_margin_mm(
+            board,
+            &mut candidate,
+            synth_place::tight_edge_margin_mm(board),
+        );
+        if !repacked.contains(&candidate) {
+            repacked.push(candidate);
+        }
+    }
+    Ok(repacked)
+}
+
 fn export_inner(
     board: &Board,
     out_dir: &Path,
