@@ -58,12 +58,12 @@ impl Default for RePlAceParams {
             gamma_start_mm: 20.0,
             gamma_end_mm: 0.5,
             gamma_decay: 0.5,
-            lambda_start: 1.0,
+            lambda_start: 0.5,
             lambda_growth: 2.0,
             step_mm: 0.2,
             max_step_mm: 2.0,
             net_weight: 1.0,
-            legalizer_gap_mm: 0.0,
+            legalizer_gap_mm: 0.5,
         }
     }
 }

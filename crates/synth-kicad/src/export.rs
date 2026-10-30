@@ -730,7 +730,14 @@ fn place_for_export(
     // Local experiment seam for the RePlAce params loop; production never sets
     // it. The route-free export still validates and fits the outline below.
     if std::env::var_os("SYNTH_PLACE_REPLACE").is_some() {
-        if let Ok(placement) = synth_place::place_with_replace(board) {
+        if let Ok(mut placement) = synth_place::place_with_replace(board) {
+            // Match the export candidate set: fit the tight rim before the
+            // PCB is serialized, or the score compares different outlines.
+            synth_place::fit_outline_with_margin_mm(
+                board,
+                &mut placement,
+                synth_place::tight_edge_margin_mm(board),
+            );
             return Ok(placement);
         }
     }
