@@ -1,0 +1,1 @@
+examples/env_logger/env_logger.synth

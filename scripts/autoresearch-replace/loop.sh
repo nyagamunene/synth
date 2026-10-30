@@ -11,9 +11,13 @@ MAX_SECONDS=${MAX_SECONDS:-28800}
 MAX_DISCARDS=${MAX_DISCARDS:-10}
 HEARTBEAT=${HEARTBEAT:-60}
 AR=scripts/autoresearch-replace
+export AR_PLACE_REPLACE=1
 
 LOG=results-replace.tsv
 LOGDIR=logs/autoresearch-replace
+VISION_DIR=$LOGDIR/vision
+BEST_VISION=$VISION_DIR/best
+export AR_VISION_BOARDS=${AR_VISION_BOARDS:-secure_tracker,sensor_logger}
 NOTE=$PWD/ar-note.txt
 FOCUS=${FOCUS:-"tune replace_params.rs: reduce dead space and area, routability first"}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
@@ -28,8 +32,15 @@ say() { printf '[%s +%s] %s\n' "$(stamp)" "$(elapsed)" "$*" | tee -a "$LOGDIR/lo
 dbg() { printf '[%s +%s]   %s\n' "$(stamp)" "$(elapsed)" "$*" >>"$LOGDIR/loop.log"; }
 section() { say "===== $* ====="; }
 delta() { awk -v a="$1" -v b="$2" 'BEGIN { if (a + 0 == a) printf "%.1f (%+.1f)", a, a - b; else printf "%s", a }'; }
-log() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$LOG"; }
-revert() { git reset -q --hard HEAD && git clean -fdq -- crates fixtures examples scripts/autoresearch-replace/boards; }
+log() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$LOG"; }
+revert() { git reset -q --hard HEAD && git clean -fdq -- crates; }
+vision_promote() {
+  local source=$1
+  mkdir -p "$BEST_VISION"
+  if [ -d "$source" ]; then
+    cp -f "$source"/*.png "$BEST_VISION"/ 2>/dev/null || true
+  fi
+}
 finish() {
   say "STOP: $1"
   say "summary: elapsed $(elapsed)${base_t:+ | tuning $base_t -> ${best_t:-?} | held-out $base_h -> ${best_h:-?}}"
@@ -58,9 +69,9 @@ wire_total() {
   local file=${3:-$2}
   awk '/^WIRE/ {print $2}' "$LOGDIR/$file.log"
 }
-fitness_total() {
+gates_total() {
   local file=${3:-$2}
-  awk '/^FITNESS/ {print $2}' "$LOGDIR/$file.log"
+  awk '/^GATES/ {print $2}' "$LOGDIR/$file.log"
 }
 build() {
   local b0=$SECONDS
@@ -85,13 +96,10 @@ def num(value):
 
 
 print(f"  {label}:")
-print(
-    f"    {'board':<30} {'score':>8} {'dead':>7} {'area':>8} {'wire':>8} "
-    f"{'open':>5} {'drc':>4} {'fit':>4} {'sup':>7} {'rail':>6} {'in':>6}"
-)
+print(f"    {'board':<34} {'score':>9} {'dead':>7} {'area':>8} {'wire':>8} {'open':>5} {'drc':>4}")
 for line in open(path):
     line = line.strip()
-    if not line or line.startswith(("SCORE", "WIRE", "FITNESS")):
+    if not line or line.startswith(("SCORE", "WIRE")):
         continue
     parts = line.split(" ", 1)
     if len(parts) != 2:
@@ -105,15 +113,11 @@ for line in open(path):
     if not data.get("ok"):
         print(f"    {board:<34} FAIL {str(data.get('why', ''))[:90]}")
         continue
-    def opt(value, fmt="{:.2f}"):
-        return "-" if value is None else fmt.format(value)
-
     print(
-        f"    {board:<30} {num(data.get('score')):>8.1f} {num(data.get('dead_mm2')):>7.0f} "
-        f"{num(data.get('area_mm2')):>8.1f} {num(data.get('wire_length_mm')):>8.1f} "
-        f"{num(data.get('open')):>5} {num(data.get('errors')):>4} "
-        f"{num(data.get('fitness_failures')):>4} {opt(data.get('support_mean'), '{:>7.2f}'):>7} "
-        f"{opt(data.get('rail_band'), '{:>6.2f}'):>6} {opt(data.get('mating_inset'), '{:>6.2f}'):>6}"
+        f"    {board:<30} {num(data.get('score')):>8.1f} {num(data.get('dead_mm2')):>6.0f} "
+        f"{num(data.get('area_mm2')):>7.1f} {num(data.get('wire_length_mm')):>7.1f} "
+        f"{num(data.get('fitness_score')):>5.1f} {num(data.get('fitness_gate_failures')):>4} "
+        f"{num(data.get('support_mean_mm')):>5.2f} {num(data.get('mating_inset_mm')):>5.2f}"
     )
 PY
 }
@@ -139,31 +143,29 @@ say "focus: $FOCUS"
 say "table: $LOG | agent: $AR | logs: $LOGDIR"
 git diff --quiet -- crates || finish "uncommitted changes under crates/, refusing to start" 1
 git add $AR && git commit -qsm "NOISSUE - replace params autoresearch harness" >/dev/null 2>&1
-if [ -f "$LOG" ] && [ "$(head -1 "$LOG" | awk -F'\t' '{print NF}')" != "9" ]; then
-  mv "$LOG" "$LOG.old.$(date +%s)"
-fi
-[ -f $LOG ] || printf 'round\tcommit\ttuning_score\theldout_score\ttuning_wire\theldout_wire\tfitness\tstatus\tnote\n' >$LOG
+[ -f $LOG ] || printf 'round\tcommit\ttuning_score\theldout_score\ttuning_wire\theldout_wire\ttuning_gates\theldout_gates\tstatus\tnote\n' >$LOG
 
 section "baseline"
 say "baseline: building"
 build || finish "baseline build failed" 1
 say "baseline: scoring ($(wc -l <"$AR/corpus_tuning.txt") tuning + $(wc -l <"$AR/corpus_heldout.txt") held-out boards)"
+export AR_VISION_DIR="$VISION_DIR/baseline"
 best_t=$(total $AR/corpus_tuning.txt tuning); best_h=$(total $AR/corpus_heldout.txt heldout)
 best_w=$(wire_total $AR/corpus_tuning.txt tuning); best_hw=$(wire_total $AR/corpus_heldout.txt heldout)
-best_ft=$(fitness_total $AR/corpus_tuning.txt tuning)
-best_fh=$(fitness_total $AR/corpus_heldout.txt heldout)
+base_gates_t=$(gates_total $AR/corpus_tuning.txt tuning); base_gates_h=$(gates_total $AR/corpus_heldout.txt heldout)
+case $base_gates_t in ""|*FAIL*) finish "baseline tuning gates missing, see $LOGDIR/tuning.log" 1;; esac
+case $base_gates_h in ""|*FAIL*) finish "baseline held-out gates missing, see $LOGDIR/heldout.log" 1;; esac
 case $best_t in ""|*FAIL*) finish "baseline tuning did not score, see $LOGDIR/tuning.log" 1;; esac
 case $best_h in ""|*FAIL*) finish "baseline held-out did not score, see $LOGDIR/heldout.log" 1;; esac
 case $best_w in ""|*FAIL*) finish "baseline tuning wire missing, see $LOGDIR/tuning.log" 1;; esac
 case $best_hw in ""|*FAIL*) finish "baseline held-out wire missing, see $LOGDIR/heldout.log" 1;; esac
-case $best_ft in ""|*FAIL*) finish "baseline fitness missing, see $LOGDIR/tuning.log" 1;; esac
-case $best_fh in ""|*FAIL*) finish "baseline held-out fitness missing, see $LOGDIR/heldout.log" 1;; esac
-best_f=$((best_ft + best_fh))
-base_t=$best_t; base_h=$best_h; base_w=$best_w; base_hw=$best_hw; base_f=$best_f
+base_t=$best_t; base_h=$best_h; base_w=$best_w; base_hw=$best_hw
+best_gates_t=$base_gates_t; best_gates_h=$base_gates_h
 board_report "$LOGDIR/tuning.log" "baseline tuning"
 board_report "$LOGDIR/heldout.log" "baseline held-out"
-say "baseline: tuning $base_t (wire $base_w, fitness $best_ft), held-out $base_h (wire $base_hw, fitness $best_fh), total fitness $base_f, elapsed $(elapsed)"
-log 0 "$(git rev-parse --short HEAD)" "$best_t" "$best_h" "$best_w" "$best_hw" "$best_f" baseline "start"
+vision_promote "$AR_VISION_DIR"
+say "baseline: tuning $base_t (wire $base_w), held-out $base_h (wire $base_hw), gates $base_gates_t/$base_gates_h, elapsed $(elapsed)"
+log 0 "$(git rev-parse --short HEAD)" "$best_t" "$best_h" "$best_w" "$best_hw" "$base_gates_t" "$base_gates_h" baseline "start"
 
 start=$SECONDS; discards=0
 for i in $(seq 1 "$MAX_EXP"); do
@@ -171,22 +173,29 @@ for i in $(seq 1 "$MAX_EXP"); do
   [ "$discards" -lt "$MAX_DISCARDS" ] || finish "$MAX_DISCARDS discards in a row"
   r="r$i/$MAX_EXP"
   section "$r"
-  say "$r start: elapsed $(elapsed), budget left $(dur $((MAX_SECONDS - (SECONDS - start)))), best tuning $best_t / held-out $best_h, fitness tuning $best_ft / held-out $best_fh, discards $discards"
+  say "$r start: elapsed $(elapsed), budget left $(dur $((MAX_SECONDS - (SECONDS - start)))), best tuning $best_t / held-out $best_h, discards $discards"
   rm -f $NOTE
+  vision_args=()
+  for image in "$BEST_VISION"/*.png; do
+    [ -f "$image" ] && vision_args+=(--file "$image")
+  done
+  vision_note=""
+  if [ ${#vision_args[@]} -gt 0 ]; then
+    vision_note="Attached current best placement image(s): $(printf '%s ' "$BEST_VISION"/*.png | sed 's|.*/||'). Use them to see dead space; the numeric table follows."
+  fi
   prompt="$(sed "s|/tmp/ar-note.txt|$NOTE|g" $AR/program.md)
-
-Note path: $NOTE
 
 ${FOCUS:+Focus of this loop (stay on it unless it is exhausted): $FOCUS
 }
-Best so far: tuning $best_t, held-out $best_h, fitness gate failures tuning $best_ft / held-out $best_fh (total $best_f).
-Recent rounds:
+Best so far: tuning $best_t, held-out $best_h, gates $best_gates_t/$best_gates_h.
+${vision_note:+$vision_note
+}Recent rounds:
 $(tail -n 8 $LOG)"
 
   alog=$LOGDIR/agent-$i.log
   t0=$SECONDS; tick=0
   dbg "agent log: $alog"
-  PATH="$GUARD:$PATH" setsid timeout 1800 opencode run --auto --agent build --model "$MODEL" "$prompt" >"$alog" 2>&1 &
+  PATH="$GUARD:$PATH" setsid timeout 1800 opencode run --auto --agent build --model "$MODEL" "${vision_args[@]}" "$prompt" >"$alog" 2>&1 &
   pid=$!
   while kill -0 $pid 2>/dev/null; do
     sleep "$HEARTBEAT"
@@ -210,49 +219,44 @@ $(tail -n 8 $LOG)"
 
   if git diff --quiet -- crates; then
     say "$r NOOP agent $adur, no edit${note:+ ($note)}"
-    log "$i" - - - - - "$best_f" noop "${note:-no change}"; discards=$((discards + 1)); continue
+    log "$i" - - - - - noop "${note:-no change}"; discards=$((discards + 1)); continue
   fi
   files=$(git diff --name-only -- crates | xargs -n1 basename | paste -sd, -)
   say "$r agent $adur $(git diff --numstat -- crates | awk '{a += $1; d += $2} END {printf "+%d/-%d", a, d}') [$files]"
-  if git diff --name-only | grep -Evq '^crates/synth-place/src/(replace_params\.rs|replace\.rs|lib\.rs)$'; then
-    say "$r REJECT touched a frozen file (only replace_params.rs, replace.rs and the legalizer in lib.rs are allowed)"
-    revert; log "$i" - - - - - "$best_f" rejected "touched frozen files"; discards=$((discards + 1)); continue
-  fi
-  if git status --porcelain | grep -Eq '^\?\? (fixtures|examples|scripts/autoresearch-replace/boards)/'; then
-    say "$r REJECT created an untracked design sidecar"
-    revert; log "$i" - - - - - "$best_f" rejected "untracked design file"; discards=$((discards + 1)); continue
+  if git diff --name-only | grep -Evq '^crates/(synth-place|synth-layout|synth-kicad)/src/'; then
+    say "$r REJECT touched files outside the allowed folders"
+    revert; log "$i" - - - - - rejected "touched frozen files"; discards=$((discards + 1)); continue
   fi
   if git diff | grep -Eq '^-.*#\[test\]'; then
     say "$r REJECT removed a test"
-    revert; log "$i" - - - - - "$best_f" rejected "removed a test"; discards=$((discards + 1)); continue
+    revert; log "$i" - - - - - rejected "removed a test"; discards=$((discards + 1)); continue
   fi
   say "$r building"
   if ! build; then
-    revert; log "$i" - - - - - "$best_f" crash "build failed: $note"; discards=$((discards + 1)); continue
+    revert; log "$i" - - - - - crash "build failed: $note"; discards=$((discards + 1)); continue
   fi
 
   say "$r scoring ($(wc -l <$AR/corpus_tuning.txt) tuning + $(wc -l <$AR/corpus_heldout.txt) held-out boards)"
+  export AR_VISION_DIR="$VISION_DIR/round-$i"
   t=$(total $AR/corpus_tuning.txt tuning "tuning-$i"); h=$(total $AR/corpus_heldout.txt heldout "heldout-$i")
   w_t=$(wire_total $AR/corpus_tuning.txt tuning "tuning-$i"); w_h=$(wire_total $AR/corpus_heldout.txt heldout "heldout-$i")
-  f_t=$(fitness_total $AR/corpus_tuning.txt tuning "tuning-$i"); f_h=$(fitness_total $AR/corpus_heldout.txt heldout "heldout-$i")
-  case "${f_t}${f_h}" in *FAIL*|"") f=FAIL ;; *) f=$((f_t + f_h)) ;; esac
+  gt=$(gates_total $AR/corpus_tuning.txt tuning "tuning-$i"); gh=$(gates_total $AR/corpus_heldout.txt heldout "heldout-$i")
   board_report "$LOGDIR/tuning-$i.log" "$r tuning"
   board_report "$LOGDIR/heldout-$i.log" "$r held-out"
   failed=$(grep -h '"ok": false' $LOGDIR/tuning-$i.log $LOGDIR/heldout-$i.log | awk '{n = split($1, a, "/"); printf "%s ", a[n]}')
   lognote="$note${failed:+ [failed: $failed]}"
   dt=$(delta "$t" "$best_t"); dh=$(delta "$h" "$best_h")
-  # 9th positional is the wire-growth cap; fitness values follow it.
-  if python3 -c "import sys; sys.path.insert(0,'$AR'); import score; sys.exit(0 if score.should_keep(*sys.argv[1:14]) else 1)" "$t" "$h" "$best_t" "$best_h" "$w_t" "$w_h" "$best_w" "$best_hw" "0.02" "$f_t" "$f_h" "$best_ft" "$best_fh"; then
+  if python3 -c "import sys; sys.path.insert(0,'$AR'); import score; sys.exit(0 if score.should_keep(*sys.argv[1:13]) else 1)" "$t" "$h" "$best_t" "$best_h" "$w_t" "$w_h" "$best_w" "$best_hw" "$gt" "$gh" "$best_gates_t" "$best_gates_h"; then
     git add -A crates && git commit -qsm "NOISSUE - replace params research round $i: ${lognote:-change}"
     c=$(git rev-parse --short HEAD)
-    say "$r KEEP tuning $dt | held-out $dh | wire $w_t/$w_h | fitness $f | commit $c | elapsed $(elapsed) | ${note:0:70}"
-    log "$i" "$c" "$t" "$h" "$w_t" "$w_h" "$f" keep "$lognote"
-    best_t=$t; best_h=$h; best_w=$w_t; best_hw=$w_h
-    best_ft=$f_t; best_fh=$f_h; best_f=$f; discards=0
+    vision_promote "$AR_VISION_DIR"
+    say "$r KEEP tuning $dt | held-out $dh | wire $w_t/$w_h | gates $gt/$gh | commit $c | elapsed $(elapsed) | ${note:0:70}"
+    log "$i" "$c" "$t" "$h" "$w_t" "$w_h" "$gt" "$gh" keep "$lognote"
+    best_t=$t; best_h=$h; best_w=$w_t; best_hw=$w_h; best_gates_t=$gt; best_gates_h=$gh; discards=0
   else
     revert; discards=$((discards + 1))
-    say "$r DISCARD tuning $dt | held-out $dh | wire $w_t/$w_h | fitness $f/$best_f${failed:+ | failed: $failed} | elapsed $(elapsed) | ${note:0:60}"
-    log "$i" - "$t" "$h" "$w_t" "$w_h" "$f" discard "$lognote"
+    say "$r DISCARD tuning $dt | held-out $dh | wire $w_t/$w_h | gates $gt/$gh${failed:+ | failed: $failed} | elapsed $(elapsed) | ${note:0:60}"
+    log "$i" - "$t" "$h" "$w_t" "$w_h" "$gt" "$gh" discard "$lognote"
   fi
 done
 finish "reached $MAX_EXP rounds"

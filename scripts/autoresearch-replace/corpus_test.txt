@@ -1,0 +1,1 @@
+scripts/autoresearch-replace/boards/irrigation/irrigation_controller.synth
