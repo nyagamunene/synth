@@ -374,7 +374,10 @@ fn project_constraints(problem: &Problem, centers: &mut [Point]) {
 /// more unrouted nets. One pass, deterministic order; the caller bounds the
 /// repetition.
 fn push_out_of_dense_rings_once(problem: &Problem, centers: &mut [Point]) -> bool {
-    let ring_nm = mm_to_nm(crate::DENSE_PART_RING_MM) as f64;
+    // The ring is added to the dense courtyard's width/height, so half of it
+    // is the clearance per side. Using the full ring here doubles the gap and
+    // spreads the board out.
+    let ring_nm = mm_to_nm(crate::DENSE_PART_RING_MM / 2.0) as f64;
     let mut changed = false;
     for first in 0..centers.len() {
         if !problem.free[first] || problem.dense[first] {
@@ -610,6 +613,28 @@ mod tests {
             usable: Rect::new(Point::new(0, 0), Point::new(100_000_000, 100_000_000)),
             spacing_nm: 0.0,
         }
+    }
+
+    #[test]
+    fn the_dense_ring_leaves_half_the_ring_as_clearance() {
+        // The default placer inflates a dense courtyard by the full ring, so
+        // the gap to a neighbour is half the ring per side. The analytical
+        // projection must use the same clearance, not the full ring.
+        let mut instance = problem(
+            vec![false, true],
+            vec![Some((50_000_000.0, 50_000_000.0)), None],
+            Vec::new(),
+        );
+        instance.dense = vec![true, false];
+        instance.half = vec![(2_000_000.0, 2_000_000.0), (1_000_000.0, 1_000_000.0)];
+
+        let solved = solve(&instance);
+        let gap = (solved[0].x_nm - solved[1].x_nm).abs() as f64 - 3_000_000.0;
+        let expected = mm_to_nm(crate::DENSE_PART_RING_MM / 2.0) as f64;
+        assert!(
+            (gap - expected).abs() < 1.0,
+            "dense ring gap {gap} nm, expected {expected} nm"
+        );
     }
 
     #[test]
