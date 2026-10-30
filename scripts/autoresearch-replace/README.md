@@ -41,8 +41,10 @@ frozen.
 
 ## Corpus
 
-- Tuning: `secure_tracker`, `sensor_logger`, `decoupling_heavy`,
-  `iot_sensor_board`.
+- Tuning: `sensor_logger`, `decoupling_heavy`, `iot_sensor_board`.
+- Blocked: `secure_tracker` — both routers leave `net_1` open
+  (`J1.A1` reaches only 4 of 8 pads). Fix the connector net or the board's
+  shield-pad mapping before returning it to tuning; see `corpus_blocked.txt`.
 - Held-out: `ldo_block`, `divider`, `mcu`, `placement_and_diff_pair`.
 - Test (scored once at the end): `irrigation_controller`.
 - Sidecar-pinned: `env_logger` is excluded; a sidecar means the placer is not

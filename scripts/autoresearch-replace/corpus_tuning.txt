@@ -1,4 +1,3 @@
-fixtures/designs/secure_tracker.synth
 examples/sensor_logger/sensor_logger.synth
 fixtures/designs/decoupling_heavy.synth
 fixtures/designs/iot_sensor_board.synth
