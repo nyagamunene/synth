@@ -77,6 +77,7 @@ pub mod advisor;
 mod analytic;
 pub mod board_family;
 pub mod cem;
+pub mod fitness;
 pub mod floorplan;
 pub mod modules;
 pub mod outline_packer;
@@ -93,6 +94,7 @@ use synth_ir::{Board, ComponentId, PinId};
 use thiserror::Error;
 
 mod routability;
+pub use fitness::{fitness, FitnessMetric, PlacementFitness};
 pub use routability::{routability, RoutabilityEstimate};
 
 /// Final position + orientation of a single component on the PCB.

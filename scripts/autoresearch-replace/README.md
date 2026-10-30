@@ -21,6 +21,15 @@ may be marked untrusted by pre-existing ERC/footprint overrides; the routed and
 DRC lines are the gate, not the override status. The scorer and corpus are
 frozen.
 
+The driver passes `--fitness-json`, so the export also writes a placement
+fitness report. `FITNESS` is the total `gate_failures` over the corpus: support
+distance (3 mm decoupling, 5 mm rail/load; a part's declared `max_distance_mm`
+overrides the default), rail-band passives (one failure when any passive is in
+the lane, excluding parts within 2 mm of a connector), and connector mating
+inset (3 mm, the nearest edge when no mating face is declared; a body outside
+the outline fails). A keep requires `FITNESS` not to rise above the current
+best on either corpus. The 0–100 composite is a diagnostic, not an objective.
+
 ## Corpus
 
 - Tuning: `secure_tracker`, `sensor_logger`, `env_logger`, `decoupling_heavy`,

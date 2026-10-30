@@ -327,26 +327,53 @@ def should_keep(
     best_wire_t=None,
     best_wire_h=None,
     growth=0.02,
+    fitness_t=None,
+    fitness_h=None,
+    best_fitness_t=None,
+    best_fitness_h=None,
 ):
-    """Keep only on a score win, with neither corpus's routed wire growing > growth."""
+    """Keep only on a score win, routed wire within growth, and no new fitness gate failures.
+
+    The four fitness values are optional so metric-only callers keep working;
+    when supplied, a missing or failing value rejects the change. Each corpus
+    is gated separately, like the wire cap.
+    """
     fields = (tune, held, best_tune, best_held)
     if "" in fields or "FAIL" in fields:
         return False
     try:
         if not keep(float(tune), float(held), float(best_tune), float(best_held)):
             return False
-    except ValueError:
+        growth = float(growth)
+    except (TypeError, ValueError):
         return False
     if wire_t is None and wire_h is None:
-        return True  # metric-only callers
-    wires = (wire_t, wire_h, best_wire_t, best_wire_h)
-    if any(v is None or v == "" or v == "FAIL" for v in wires):
+        wire_ok = True  # metric-only callers
+    else:
+        wires = (wire_t, wire_h, best_wire_t, best_wire_h)
+        if any(v is None or v == "" or v == "FAIL" for v in wires):
+            return False
+        try:
+            wire_ok = float(wire_t) <= float(best_wire_t) * (1 + growth) and float(
+                wire_h
+            ) <= float(best_wire_h) * (1 + growth)
+        except ValueError:
+            return False
+    fitness = (fitness_t, fitness_h, best_fitness_t, best_fitness_h)
+    if all(value is None for value in fitness):
+        return wire_ok
+    if any(value is None or value == "" or value == "FAIL" for value in fitness):
         return False
     try:
-        return float(wire_t) <= float(best_wire_t) * (1 + growth) and float(
-            wire_h
-        ) <= float(best_wire_h) * (1 + growth)
-    except ValueError:
+        values = (int(fitness_t), int(fitness_h), int(best_fitness_t), int(best_fitness_h))
+        if any(value < 0 for value in values):
+            return False
+        return (
+            wire_ok
+            and values[0] <= values[2]
+            and values[1] <= values[3]
+        )
+    except (TypeError, ValueError):
         return False
 
 
@@ -359,6 +386,7 @@ def merged_registry(dest):
 
 def score_board(synth_bin, design, out_dir, krt_repo, krt_python, registry=None):
     start = time.monotonic()
+    fitness_path = pathlib.Path(out_dir) / "fitness.json"
     try:
         router = router_for(design)
         router_args = (
@@ -371,6 +399,7 @@ def score_board(synth_bin, design, out_dir, krt_repo, krt_python, registry=None)
             [
                 synth_bin, "export-kicad", design, "--out", out_dir, "--force",
                 "--router", router,
+                "--fitness-json", str(fitness_path),
                 *router_args,
                 *(["--registry", registry] if registry else []),
             ],
@@ -380,12 +409,34 @@ def score_board(synth_bin, design, out_dir, krt_repo, krt_python, registry=None)
     except subprocess.TimeoutExpired:
         return {"open": None, "errors": None, "unconnected": None, "ok": False,
                 "why": "timeout after 900s", "area_mm2": None, "dead_mm2": None,
-                "corner_dead_mm2": None, "connector_violations": None, "score": None}
+                "corner_dead_mm2": None, "connector_violations": None, "score": None,
+                "fitness": None, "fitness_failures": None, "support_mean": None,
+                "rail_band": None, "mating_inset": None}
     text = run.stdout + run.stderr
     g = gates(text, run.returncode)
     if not g["ok"]:
         lines = [line for line in text.strip().splitlines() if line.strip()]
         g["why"] = " | ".join(lines[-5:])[:400] or "no output"
+    if g["ok"]:
+        try:
+            report = json.loads(fitness_path.read_text())
+            if not isinstance(report, dict):
+                raise ValueError("fitness report is not an object")
+            failures = int(report["gate_failures"])
+            if failures < 0:
+                raise ValueError("fitness gate_failures is negative")
+            by_key = {row["key"]: row for row in report.get("metrics", [])}
+            g["fitness"] = report
+            g["fitness_failures"] = failures
+            g["support_mean"] = by_key.get("support_distance", {}).get("mean")
+            g["rail_band"] = by_key.get("rail_band", {}).get("mean")
+            g["mating_inset"] = by_key.get("mating_inset", {}).get("mean")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            g["ok"] = False
+            g["why"] = "fitness report missing or malformed"
+            g["fitness"] = None
+            g["fitness_failures"] = None
+            g["support_mean"] = g["rail_band"] = g["mating_inset"] = None
     pcbs = sorted(pathlib.Path(out_dir).glob("*.kicad_pcb"))
     if g["ok"] and pcbs:
         pcb = pcbs[0].read_text()
@@ -412,6 +463,9 @@ def score_board(synth_bin, design, out_dir, krt_repo, krt_python, registry=None)
         g["area_mm2"] = g["dead_mm2"] = g["corner_dead_mm2"] = g["score"] = None
         g["connector_violations"] = None
         g["label_overlaps"] = g["labels_off_board"] = g["labels_hidden"] = None
+        g["fitness"] = None
+        g["fitness_failures"] = None
+        g["support_mean"] = g["rail_band"] = g["mating_inset"] = None
     # The exporter names the record after the board, not the source file, so a
     # design whose board name differs from its filename has no `<stem>.json`.
     records = sorted(pathlib.Path(out_dir).glob("*.routing.json"))
@@ -441,7 +495,7 @@ if __name__ == "__main__":
 
     home = os.path.expanduser("~/tools")
     synth = os.environ.get("SYNTH_BIN", "target/release/synth")
-    total, wire_total, failed = 0.0, 0.0, []
+    total, wire_total, fitness_total, failed = 0.0, 0.0, 0, []
     reg_dir = tempfile.TemporaryDirectory(prefix="ar-shape-reg-")
     reg = merged_registry(reg_dir.name)
     for design in sys.argv[1:]:
@@ -453,7 +507,9 @@ if __name__ == "__main__":
         if s["ok"]:
             total += s["score"]
             wire_total += s.get("wire_length_mm") or 0
+            fitness_total += s.get("fitness_failures") or 0
         else:
             failed.append(design)
     print(f"SCORE {'FAIL' if failed else round(total, 2)} failed={len(failed)}")
     print(f"WIRE {round(wire_total, 1)}")
+    print(f"FITNESS {'FAIL' if failed else fitness_total}")
