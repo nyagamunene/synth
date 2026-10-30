@@ -54,3 +54,13 @@ current branch tip `0395c6b`.
 - `score.py` — export, gates, dead/area/connector/label score.
 - `loop.sh` — build/score/prompt/keep/revert.
 - `corpus_tuning.txt`, `corpus_heldout.txt`, `extra_parts/`.
+
+## Logs
+
+- `results/<arm>.out` — console log from `run.sh` (start header, arm PID, final summary).
+- `arms/<arm>/logs/autoresearch-replace/loop.log` — full driver log: phases, elapsed
+  time, build/score durations, per-board tables, agent exit codes, keep/discard reasons.
+- `arms/<arm>/logs/autoresearch-replace/agent-<n>.log` — the OpenCode transcript for round n.
+- `arms/<arm>/logs/autoresearch-replace/tuning-<n>.log` / `heldout-<n>.log` — per-board JSON
+  from the scorer.
+- `arms/<arm>/results-replace.tsv` — one row per round (round, commit, scores, wire, status, note).
