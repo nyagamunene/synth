@@ -35,6 +35,9 @@ from pathlib import Path
 # router refused this board" from "the router broke".
 POLICY_REJECTED = 3
 
+# Engine via penalty for the first attempt; its own default is 75.
+KEEP_LAYER_VIA_COST = 1000
+
 
 def _load_summary(stats: Path) -> dict:
     """Read the engine's JSON summary, or explain why it could not be read."""
@@ -44,6 +47,25 @@ def _load_summary(stats: Path) -> dict:
         return json.loads(stats.read_text())
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"could not parse the KRT summary at {stats}: {error}") from error
+
+
+def _failed_count(report: dict) -> int:
+    """The summary's aggregate failure count, which may come with no net names."""
+    failed = report.get("failed")
+    if isinstance(failed, bool) or not isinstance(failed, (int, float)):
+        return 0
+    return int(failed) if failed > 0 else 0
+
+
+def _failed_nets(stats: Path) -> bool:
+    """Whether the engine's summary shows an open or failed connection group."""
+    try:
+        report = _load_summary(stats)
+    except RuntimeError:
+        return True
+    return _failed_count(report) > 0 or any(
+        report.get(key) for key in ("failed_single", "open_single", "failed_multipoint")
+    )
 
 
 def _policy_findings(report: dict, allow_via_in_pad: bool) -> list[str]:
@@ -56,6 +78,8 @@ def _policy_findings(report: dict, allow_via_in_pad: bool) -> list[str]:
     )
     if open_items:
         findings.append(f"{open_items} open/failed connection group(s)")
+    elif failed := _failed_count(report):
+        findings.append(f"{failed} failed connection(s) reported without net names")
 
     design_rules = report.get("design_rules") or {}
     floors = design_rules.get("board_floors") or {}
@@ -137,8 +161,22 @@ def main() -> int:
     if not args.no_write_fill:
         command.append("--write-fill")
 
+    # A layer change on a signal net cuts its return path and W-SYNTH-DRC-016
+    # flags it, so the first attempt prices vias high and keeps nets on one
+    # layer. A board that does not route that way is routed again at the
+    # engine's own via cost rather than failed.
+    # The summary and the board are the evidence for the attempt that wrote
+    # them, so both are removed before each attempt: an attempt that writes
+    # none is a failure rather than a pass on the previous attempt's output.
     print("running KiCadRoutingTools:", " ".join(command), flush=True)
-    completed = subprocess.run(command, check=False)
+    stats.unlink(missing_ok=True)
+    args.output_board.unlink(missing_ok=True)
+    completed = subprocess.run([*command, "--via-cost", str(KEEP_LAYER_VIA_COST)], check=False)
+    if completed.returncode or _failed_nets(stats):
+        print("retrying KiCadRoutingTools at its default via cost", flush=True)
+        stats.unlink(missing_ok=True)
+        args.output_board.unlink(missing_ok=True)
+        completed = subprocess.run(command, check=False)
 
     policy_ok = completed.returncode == 0
     if completed.returncode:

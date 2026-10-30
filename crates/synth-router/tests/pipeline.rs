@@ -895,8 +895,12 @@ SAVED_EOF"#,
     assert!(!delivered.contains("(xy 5 5)"), "stale copper survived");
 }
 
+/// The island repair needs the filled board, so a fill that fails means pour
+/// islands cannot be checked. That is a required check that did not run: the
+/// candidate is review-required and the un-routed baseline stays in place,
+/// never a routed board delivered unchecked.
 #[test]
-fn a_fill_that_fails_still_delivers_the_routed_board() {
+fn a_fill_that_fails_blocks_the_board_because_islands_cannot_be_checked() {
     let scratch = Scratch::new("zonefill_fail");
     let with_zone = routed_board_with_zone();
     let router = StubRouter::new("zonefill_fail_router", Behaviour::Write(with_zone));
@@ -905,13 +909,27 @@ fn a_fill_that_fails_still_delivers_the_routed_board() {
     let _env = router.activate(&jar, &java);
 
     let report = synth_router::route(&request_for(&scratch, 120));
-    assert_eq!(report.state, RouteState::Routed, "{:?}", report.validation);
+    assert_eq!(
+        report.state,
+        RouteState::ReviewRequired,
+        "{:?}",
+        report.validation
+    );
+    let validation = report.validation.expect("validation ran");
+    assert!(
+        validation
+            .unavailable_checks
+            .iter()
+            .any(|check| check.contains("pour island repair did not run")),
+        "{:?}",
+        validation.unavailable_checks
+    );
     assert!(marker.exists());
-    assert_board(&scratch.file("demo.kicad_pcb"), with_zone);
+    assert_board(&scratch.file("demo.kicad_pcb"), PARTIAL_BOARD);
 }
 
 #[test]
-fn a_garbage_save_is_rejected_and_leaves_no_staged_file() {
+fn a_garbage_save_is_rejected_and_the_board_is_not_delivered() {
     let scratch = Scratch::new("zonefill_garbage");
     let with_zone = routed_board_with_zone();
     let router = StubRouter::new("zonefill_garbage_router", Behaviour::Write(with_zone));
@@ -920,9 +938,22 @@ fn a_garbage_save_is_rejected_and_leaves_no_staged_file() {
     let _env = router.activate(&jar, &java);
 
     let report = synth_router::route(&request_for(&scratch, 120));
-    assert_eq!(report.state, RouteState::Routed, "{:?}", report.validation);
+    assert_eq!(
+        report.state,
+        RouteState::ReviewRequired,
+        "{:?}",
+        report.validation
+    );
     assert!(marker.exists());
-    assert_board(&scratch.file("demo.kicad_pcb"), with_zone);
+    assert_board(&scratch.file("demo.kicad_pcb"), PARTIAL_BOARD);
+    // The rejected save leaves no staged file beside the delivered path.
+    let staged: Vec<_> = std::fs::read_dir(&scratch.path)
+        .expect("scratch")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("staged") || name.to_ascii_lowercase().ends_with(".tmp"))
+        .collect();
+    assert!(staged.is_empty(), "staged files were left: {staged:?}");
 }
 
 /// Assert that `path` holds `expected`.

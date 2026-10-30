@@ -45,6 +45,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Test the KiCadRoutingTools adapter
+        run: python3 tools/test_kicad_routing_tools_route.py
+
       - name: Run linter
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

@@ -138,6 +138,25 @@ fn a_clean_export_is_a_production_package() {
 }
 
 #[test]
+fn a_part_with_no_kicad_symbol_is_listed_as_synthetic() {
+    // The release fixture part names a footprint but no KiCad symbol, so
+    // its schematic symbol is drawn from the registry pin map.
+    let run = export(
+        "synthetic",
+        "reviewed",
+        "rel_reviewed",
+        true,
+        &["--gerbers"],
+    );
+    let m = run.manifest.expect("manifest");
+    assert_eq!(
+        m["synthetic_symbols"],
+        serde_json::json!(["rel_reviewed"]),
+        "{m:#}"
+    );
+}
+
+#[test]
 fn unreviewed_parts_are_recorded_with_their_reviewer_state() {
     let run = export(
         "unreviewed",

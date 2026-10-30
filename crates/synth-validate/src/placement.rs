@@ -170,8 +170,11 @@ pub fn validate_placement(board: &Board, placement: &Placement, file: &str) -> V
             let center_x = (r.min.x_nm + r.max.x_nm) / 2;
             let center_y = (r.min.y_nm + r.max.y_nm) / 2;
 
-            let dx: i64 = (center_x - kx_nm).abs();
-            let dy: i64 = (center_y - ky_nm).abs();
+            // The courtyard's nearest point to the circle centre, not its own
+            // centre: a part just outside the circle can still hang its pads
+            // into the no-route zone.
+            let dx: i64 = (kx_nm.clamp(r.min.x_nm, r.max.x_nm) - kx_nm).abs();
+            let dy: i64 = (ky_nm.clamp(r.min.y_nm, r.max.y_nm) - ky_nm).abs();
             let dist_squared = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy));
             let radius_squared = keepout_radius_nm.saturating_mul(keepout_radius_nm);
 
@@ -190,7 +193,7 @@ pub fn validate_placement(board: &Board, placement: &Placement, file: &str) -> V
                     )
                     .location(Location::from_span(file.to_string(), span))
                     .expected(format!("component `{refdes}` to clear keepout `{}` radius {:.1} mm", keepout.name, radius_mm))
-                    .found(format!("`{refdes}` center at ({:.1}, {:.1}) mm is inside keepout radius of ({:.1}, {:.1}) mm", nm_to_mm(center_x), nm_to_mm(center_y), nm_to_mm(kx_nm), nm_to_mm(ky_nm)))
+                    .found(format!("`{refdes}` courtyard centred at ({:.1}, {:.1}) mm reaches inside keepout radius of ({:.1}, {:.1}) mm", nm_to_mm(center_x), nm_to_mm(center_y), nm_to_mm(kx_nm), nm_to_mm(ky_nm)))
                     .explanation_url("synth.docs/diagnostics/E-SYNTH-PLACE-004")
                     .build(),
                 );

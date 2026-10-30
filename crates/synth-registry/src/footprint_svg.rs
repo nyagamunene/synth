@@ -43,8 +43,9 @@ use std::fmt::Write as _;
 /// with a 48-unit viewBox confirms the factor.
 pub const UNIT_TO_MM: f64 = 0.254;
 
-/// Margin added around the pad extents to form the courtyard (mm).
-const COURTYARD_MARGIN_MM: f64 = 0.25;
+/// Margin added around the pad extents to form the courtyard (mm). A part's
+/// `footprint_dimensions` are its body, with this margin on top.
+pub const COURTYARD_MARGIN_MM: f64 = 0.25;
 
 /// Pad outline shape as the source describes it.
 #[derive(Debug, Clone, Copy, PartialEq)]

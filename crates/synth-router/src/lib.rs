@@ -49,6 +49,7 @@ pub mod drc;
 pub mod escape;
 pub mod failure;
 pub mod freerouting;
+pub mod island_vias;
 pub mod kicad_routing_tools;
 pub mod outcomes;
 pub mod pcb_read;
@@ -248,6 +249,24 @@ fn write_report(report: &RouteReport, request: &RouteRequest) {
     }
 }
 
+/// The verdict with the findings of the mandatory island repair added. A
+/// repair that did not run is a required check that could not be performed,
+/// which is review-required; an island it left untied is a blocking finding.
+/// Either way the candidate is not fabrication-ready, whatever the other checks
+/// said.
+fn with_repair_findings(
+    mut verdict: validate::FabricationVerdict,
+    blocking: Vec<String>,
+    unavailable: Vec<String>,
+) -> validate::FabricationVerdict {
+    if !blocking.is_empty() || !unavailable.is_empty() {
+        verdict.fabrication_ready = false;
+        verdict.blocking_reasons.extend(blocking);
+        verdict.unavailable_checks.extend(unavailable);
+    }
+    verdict
+}
+
 /// Promote a router-produced candidate into a report, installing it only if
 /// it survives independent validation.
 ///
@@ -261,7 +280,28 @@ fn finalize(
     capability: Option<&RouterCapability>,
     candidate: freerouting::Candidate,
 ) -> RouteReport {
-    let verdict = validate_candidate(request, &candidate);
+    // A pour that tracks cut into regions leaves some of them tied to nothing
+    // else. Tie each back before the candidate is judged, so the verdict is on
+    // the board that would be delivered. The repair is mandatory: when it did
+    // not run, or an island is left that it cannot tie, the candidate is not
+    // promoted, because the island is a zone against itself and KiCad refuses it.
+    let mut repair_blocking: Vec<String> = Vec::new();
+    let mut repair_unavailable: Vec<String> = Vec::new();
+    match island_vias::tie_islands(&candidate.candidate_path, &request.ground_nets) {
+        Ok(outcome) => repair_blocking = outcome.unresolved,
+        Err(detail) => {
+            eprintln!(
+                "warning: pour islands were not checked in {}: {detail}",
+                candidate.candidate_path.display()
+            );
+            repair_unavailable.push(format!("pour island repair did not run: {detail}"));
+        }
+    }
+    let verdict = with_repair_findings(
+        validate_candidate(request, &candidate),
+        repair_blocking,
+        repair_unavailable,
+    );
 
     let state = RouteReport::state_for_verdict(&verdict);
 
@@ -393,8 +433,10 @@ pub(crate) fn repo_tool(name: &str) -> Option<PathBuf> {
 /// Best-effort repository root.
 ///
 /// Prefers `CARGO_MANIFEST_DIR` (correct for a binary run out of a build
-/// tree) and falls back to walking up from the current directory (correct
-/// for an installed binary run inside a checkout).
+/// tree), then walks up from the current directory (correct for a binary run
+/// inside a checkout), then from the binary's own location (correct for a
+/// binary built in a checkout and run from anywhere, such as an MCP server
+/// started in an empty workspace).
 pub(crate) fn repo_root() -> Option<PathBuf> {
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let path = PathBuf::from(manifest);
@@ -407,12 +449,94 @@ pub(crate) fn repo_root() -> Option<PathBuf> {
             }
         }
     }
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if dir.join("tools").is_dir() && dir.join("registry").is_dir() {
-            return Some(dir);
-        }
-        dir = dir.parent()?.to_path_buf();
+    std::env::current_dir()
+        .ok()
+        .and_then(|dir| checkout_above(&dir))
+        .or_else(|| {
+            let exe = std::env::current_exe().ok()?;
+            checkout_above(exe.parent()?)
+        })
+}
+
+/// The nearest ancestor of `start`, itself included, holding both `tools/` and
+/// `registry/`.
+fn checkout_above(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join("tools").is_dir() && dir.join("registry").is_dir())
+        .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod checkout_tests {
+    use super::*;
+
+    #[test]
+    fn a_checkout_is_found_from_any_directory_inside_it() {
+        let root = std::env::temp_dir().join(format!("synth_checkout_{}", std::process::id()));
+        let nested = root.join("target").join("release");
+        std::fs::create_dir_all(&nested).expect("scratch");
+        std::fs::create_dir_all(root.join("tools")).expect("tools");
+        std::fs::create_dir_all(root.join("registry")).expect("registry");
+
+        assert_eq!(checkout_above(&nested).as_deref(), Some(root.as_path()));
+        assert_eq!(checkout_above(&root).as_deref(), Some(root.as_path()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_with_only_tools_is_not_a_checkout() {
+        let root = std::env::temp_dir().join(format!("synth_not_checkout_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("tools")).expect("scratch");
+
+        assert_ne!(checkout_above(&root).as_deref(), Some(root.as_path()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    use crate::validate::FabricationVerdict;
+
+    #[test]
+    fn a_repair_that_did_not_run_keeps_a_clean_candidate_from_being_promoted() {
+        let verdict = with_repair_findings(
+            FabricationVerdict::ready(),
+            Vec::new(),
+            vec!["pour island repair did not run: kicad-cli missing".to_string()],
+        );
+        assert!(!verdict.fabrication_ready);
+        assert_eq!(verdict.unavailable_checks.len(), 1);
+        assert_eq!(
+            RouteReport::state_for_verdict(&verdict),
+            RouteState::ReviewRequired,
+            "a required check that could not run is review-required"
+        );
+    }
+
+    #[test]
+    fn an_island_the_repair_could_not_tie_blocks_the_candidate() {
+        let verdict = with_repair_findings(
+            FabricationVerdict::ready(),
+            vec!["an island of net GND holds copper but is tied to nothing".to_string()],
+            Vec::new(),
+        );
+        assert!(!verdict.fabrication_ready);
+        assert_eq!(verdict.blocking_reasons.len(), 1);
+        assert_eq!(
+            RouteReport::state_for_verdict(&verdict),
+            RouteState::ValidationFailed
+        );
+    }
+
+    #[test]
+    fn a_clean_repair_leaves_the_verdict_as_it_was() {
+        let verdict = with_repair_findings(FabricationVerdict::ready(), Vec::new(), Vec::new());
+        assert!(verdict.fabrication_ready);
+        assert_eq!(RouteReport::state_for_verdict(&verdict), RouteState::Routed);
     }
 }
 

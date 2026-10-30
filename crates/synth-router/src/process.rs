@@ -89,13 +89,44 @@ const DRAIN_GRACE: Duration = Duration::from_secs(5);
 ///
 /// The child's stdin is closed: a router that stops to read stdin would
 /// otherwise block forever, since nothing is going to type into it.
+///
+/// Stops early, as a cancelled run, when the ambient token (see
+/// [`set_ambient_cancel`]) is cancelled.
 pub fn run(
     binary: &Path,
     args: &[String],
     budget: Duration,
     max_output_bytes: usize,
 ) -> Result<Invocation, SpawnError> {
-    run_cancellable(binary, args, budget, max_output_bytes, None, None)
+    let ambient = ambient_cancel();
+    run_cancellable(
+        binary,
+        args,
+        budget,
+        max_output_bytes,
+        ambient.as_ref(),
+        None,
+    )
+}
+
+thread_local! {
+    static AMBIENT: std::cell::RefCell<Option<CancelToken>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The token every [`run`] on this thread watches, if one is set.
+fn ambient_cancel() -> Option<CancelToken> {
+    AMBIENT.with(|slot| slot.borrow().clone())
+}
+
+/// Sets the token that every [`run`] on this thread watches, or clears it.
+///
+/// A tool call reaches the routers and KiCad through many layers that take no
+/// token; the server sets the call's token on the thread that runs the call, so
+/// cancelling it ends the external router or `kicad-cli` that call is waiting
+/// on, and every later one on that thread starts already cancelled. Threads the
+/// call spawns do not inherit it.
+pub fn set_ambient_cancel(token: Option<CancelToken>) {
+    AMBIENT.with(|slot| *slot.borrow_mut() = token);
 }
 
 /// Run with cancellation and a working directory.
@@ -411,6 +442,29 @@ mod tests {
         assert!(!run.timed_out);
         assert!(!run.succeeded());
         assert_eq!(run.exit_code, None);
+    }
+
+    #[test]
+    fn the_ambient_token_stops_a_plain_run_and_the_next_one() {
+        let token = CancelToken::new();
+        set_ambient_cancel(Some(token.clone()));
+        std::thread::spawn({
+            let token = token.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(150));
+                token.cancel();
+            }
+        });
+        let started = Instant::now();
+        let first = run(&shell(), &sh("sleep 60"), Duration::from_secs(30), 4096).expect("ran");
+        let second = run(&shell(), &sh("sleep 60"), Duration::from_secs(30), 4096).expect("ran");
+        set_ambient_cancel(None);
+        assert!(first.cancelled && second.cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "cancelling must stop the work, not wait it out: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

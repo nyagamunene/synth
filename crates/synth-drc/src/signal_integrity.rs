@@ -464,18 +464,8 @@ pub fn check_return_path_vias(
     routing: &Routing,
     stackup: &StackupProfile,
 ) -> Vec<Violation> {
-    let domains = synth_ir::infer_power_domains(board);
-    // Topology first, then the name/pin heuristic the exporter uses for plane
-    // detection: the registry types ground pins `power_input`, not
-    // `ground_reference`, so the domain map alone misses most grounds.
-    let is_ground = |net_id: NetId| {
-        board.net(net_id).is_some_and(|net| {
-            domains
-                .get(net_id)
-                .is_some_and(synth_ir::PowerDomainKind::is_ground)
-                || net_name_or_pin_is_ground(board, net)
-        })
-    };
+    let ground = ground_net_ids(board);
+    let is_ground = |net_id: NetId| ground.contains(&net_id);
     if !board.nets.iter().any(|net| is_ground(net.id)) {
         // No ground net at all: the discontinuity is the missing plane, which
         // is the design's, not this via's.
@@ -524,22 +514,61 @@ pub fn check_return_path_vias(
     out
 }
 
+/// The nets the return-path check treats as ground: by topology first, then by
+/// the name or pin-name heuristic the exporter uses for plane detection. The
+/// registry types ground pins `power_input`, not `ground_reference`, so the
+/// domain map alone misses most grounds.
+fn ground_net_ids(board: &Board) -> std::collections::BTreeSet<NetId> {
+    let domains = synth_ir::infer_power_domains(board);
+    board
+        .nets
+        .iter()
+        .filter(|net| {
+            domains
+                .get(net.id)
+                .is_some_and(synth_ir::PowerDomainKind::is_ground)
+                || net_name_or_pin_is_ground(board, net)
+        })
+        .map(|net| net.id)
+        .collect()
+}
+
+/// Names of the nets the return-path check treats as ground, for a repair pass
+/// that sees only the board file. A net called `POWER_RETURN` is ground here
+/// when its pins are, though its name says nothing.
+#[must_use]
+pub fn ground_net_names(board: &Board) -> Vec<String> {
+    let ground = ground_net_ids(board);
+    board
+        .nets
+        .iter()
+        .filter(|net| ground.contains(&net.id))
+        .map(|net| net.name.clone())
+        .collect()
+}
+
 /// Whether a net is ground by name (`gnd`, `vss`, `0v`) or by the name of a
 /// connected pin. Mirrors the exporter's plane-net classifier, so a return via
 /// is judged against the same ground the planes are built from.
 pub(crate) fn net_name_or_pin_is_ground(board: &Board, net: &Net) -> bool {
-    fn named(text: &str) -> bool {
-        let text = text.to_ascii_lowercase();
-        text.contains("gnd") || text.contains("vss") || text == "0v"
-    }
-    named(&net.name)
+    is_ground_name(&net.name)
         || net.endpoints.iter().any(|endpoint| {
             board
                 .component(endpoint.component)
                 .and_then(|component| component.part.as_ref())
                 .and_then(|part| part.pins.get(endpoint.pin.0 as usize))
-                .is_some_and(|pin| named(&pin.name))
+                .is_some_and(|pin| is_ground_name(&pin.name))
         })
+}
+
+/// Whether a net or pin name is a ground: it contains `gnd` or `vss`, or is
+/// `0v`, in any case. The one rule the return-path check, the exporter's plane
+/// classifier and the router's ground-via passes share, so `VSSA` and `VSS_IO`
+/// are ground to all of them.
+#[must_use]
+pub fn is_ground_name(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("gnd") || text.contains("vss") || text == "0v"
 }
 
 /// Copper resistivity, ohm-metres.

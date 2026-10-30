@@ -592,6 +592,10 @@ fn check_decoupling_distance(board: &Board, layout: &Layout, max_mm: f64) -> Vec
         };
 
         for req in &part.required_decoupling {
+            // A capacitor behind a series part is not at this pin.
+            if req.through.is_some() {
+                continue;
+            }
             // The rail net carrying the IC's power pin. Resolved
             // through the pin (not by net-name equality): merged rails
             // keep one global net whose name rarely equals the manifest
@@ -1594,6 +1598,8 @@ mod tests {
                 value: "100n".to_string(),
                 count: 1,
                 max_distance_mm: None,
+                to: None,
+                through: None,
             }],
             kicad_symbol: None,
             kicad_footprint: None,

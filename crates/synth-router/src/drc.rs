@@ -40,6 +40,11 @@ pub struct DrcFinding {
     /// Component reference designators KiCad attributed it to.
     #[serde(default)]
     pub references: Vec<String>,
+    /// KiCad's description of each item involved, e.g. `Pad 1 [GND] of C3 on
+    /// F.Cu` or `Zone [GND] on F.Cu`. Unlike `references`, this keeps items
+    /// whose description has no `REF, ` prefix.
+    #[serde(default)]
+    pub items: Vec<String>,
 }
 
 impl DrcFinding {
@@ -410,6 +415,20 @@ pub fn parse_report_text(text: &str) -> Option<DrcReport> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let mut items_described: Vec<String> = Vec::new();
+            for v in item
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(d) = v.get("description").and_then(serde_json::Value::as_str) {
+                    // KiCad names both ends of a zone-to-zone link the same.
+                    if !items_described.iter().any(|seen| seen == d) {
+                        items_described.push(d.to_string());
+                    }
+                }
+            }
             // Mark it by section, not by the severity KiCad happened to
             // write, so `is_blocking` and the counts agree with each other
             // and with what the section actually holds.
@@ -427,6 +446,7 @@ pub fn parse_report_text(text: &str) -> Option<DrcReport> {
                 description,
                 nets,
                 references,
+                items: items_described,
             });
         }
     }
@@ -669,6 +689,32 @@ mod tests {
         assert_eq!(report.counts().unconnected, 2);
         assert_eq!(report.counts().blocking_count(), 2);
         assert!(!report.is_clean(), "an unconnected pad still blocks");
+    }
+
+    #[test]
+    fn a_zone_listed_against_itself_at_one_point_is_still_an_open_net() {
+        // KiCad lists a zone against itself when two of its fill islands that
+        // both reach pads are not joined. The UUID and the position being the
+        // same says nothing about the other layers: the usb-uart board had a
+        // real GND split that reported exactly this pair. It must block.
+        let report = parse_report_text(
+            r#"{"violations": [],
+               "unconnected_items": [
+                 {"type": "unconnected_items", "severity": "error",
+                  "description": "Missing connection between items",
+                  "items": [
+                    {"description": "Zone [GND] on F.Cu, priority 1", "uuid": "z-1",
+                     "pos": {"x": 2.05, "y": -0.06}},
+                    {"description": "Zone [GND] on F.Cu, priority 1", "uuid": "z-1",
+                     "pos": {"x": 2.05, "y": -0.06}}
+                  ]}
+               ]}"#,
+        )
+        .expect("parses");
+        assert_eq!(report.unconnected_items, 1);
+        assert_eq!(report.counts().unconnected, 1);
+        assert_eq!(report.counts().blocking_count(), 1);
+        assert!(!report.is_clean());
     }
 
     #[test]

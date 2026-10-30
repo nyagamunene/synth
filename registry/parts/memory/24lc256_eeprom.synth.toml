@@ -1,6 +1,8 @@
 id = "24lc256_eeprom"
 kind = "memory"
-description = "Microchip 24LC256 32KB I²C EEPROM"
+description = "DEPRECATED, use 24lc256_soic8: this entry numbers VDD, GND, SDA and SCL as pins 1 to 4, but the 24LC256-I/SN has A0 to A2 on 1 to 3, VSS on 4, SDA on 5, SCL on 6, WP on 7 and VCC on 8"
+lifecycle = "obsolete"
+substitutes = ["24lc256_soic8"]
 mpn = "24LC256-I/SN"
 lcsc_pn = "C7611"
 kicad_symbol = "Memory_EEPROM:24LC256"

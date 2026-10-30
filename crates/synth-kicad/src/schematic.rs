@@ -595,10 +595,31 @@ pub(crate) fn build_sheet_schematic(
             .flat_map(|w| w.points.windows(2))
             .max_by(|a, b| segment_len(a).total_cmp(&segment_len(b)));
         if let Some(seg) = longest {
-            let at = (
-                f64::midpoint(seg[0].0, seg[1].0),
-                f64::midpoint(seg[0].1, seg[1].1),
-            );
+            // Another net's flag stub is a wire too, and the label may not touch it.
+            let stubs: Vec<Vec<(f64, f64)>> = layout
+                .net_labels
+                .iter()
+                .filter(|l| l.net != net.id)
+                .filter_map(|l| {
+                    synth_layout::route::net_label_plan(
+                        board,
+                        l.component,
+                        l.pin,
+                        &placements,
+                        l.spot,
+                    )
+                })
+                .map(|plan| plan.wire)
+                .collect();
+            let others: Vec<&[(f64, f64)]> = layout
+                .wires
+                .iter()
+                .filter(|w| w.net != net.id)
+                .map(|w| &w.points)
+                .chain(&stubs)
+                .flat_map(|points| points.windows(2))
+                .collect();
+            let at = wire_name_label_at(seg, &others);
             let uuid = derive_entity_uuid(project, "wire_name_label", &net.name);
             children.push(build_local_label(&net.name, at, uuid));
         }
@@ -821,20 +842,22 @@ fn build_power_flag_driver(
 ) -> Option<Sexp> {
     let component = board.component(driver.anchor_component)?;
     let part = component.part.as_ref()?;
-    let lib_id = part.kicad_symbol.as_deref()?;
-
-    let natural_offset = natural_rotation_offset(part);
-    // The anchor pin for an undriven power net is a declared power-input
-    // pin; those are placed un-rotated in the layout's canonical
-    // orientation, so logical rotation is zero.
-    let total_deg = natural_offset.rem_euclid(360.0);
-
-    let (x, y, dx, dy) = crate::pin_reconcile::physical_terminal(
-        lib_id,
-        &driver.anchor_pin_number,
-        driver.anchor_center,
-        total_deg,
-    )?;
+    let (x, y, dx, dy) = if let Some(terminal) = driver.anchor_terminal {
+        terminal
+    } else {
+        let lib_id = part.kicad_symbol.as_deref()?;
+        let natural_offset = natural_rotation_offset(part);
+        // The anchor pin for an undriven power net is a declared power-input
+        // pin; those are placed un-rotated in the layout's canonical
+        // orientation, so logical rotation is zero.
+        let total_deg = natural_offset.rem_euclid(360.0);
+        crate::pin_reconcile::physical_terminal(
+            lib_id,
+            &driver.anchor_pin_number,
+            driver.anchor_center,
+            total_deg,
+        )?
+    };
 
     let stub_len = POWER_FLAG_STUB_LEN;
     let flag_x = x + dx * stub_len;
@@ -1290,6 +1313,53 @@ fn build_sheet_instance(
 
 fn segment_len(seg: &[(f64, f64)]) -> f64 {
     (seg[1].0 - seg[0].0).hypot(seg[1].1 - seg[0].1)
+}
+
+/// Where a net's name label sits on its wire segment `seg`: the midpoint, or
+/// the nearest point to it that is clear of every wire in `others`. KiCad joins
+/// a label to every wire under it, so a midpoint where another net crosses
+/// would merge the two nets.
+fn wire_name_label_at(seg: &[(f64, f64)], others: &[&[(f64, f64)]]) -> (f64, f64) {
+    const STEP_MM: f64 = 1.27;
+    const CLEAR_MM: f64 = 0.5;
+    let at = |t: f64| {
+        (
+            seg[0].0 + (seg[1].0 - seg[0].0) * t,
+            seg[0].1 + (seg[1].1 - seg[0].1) * t,
+        )
+    };
+    let clear = |p: (f64, f64)| {
+        others
+            .iter()
+            .all(|other| point_to_segment_mm(p, other[0], other[1]) > CLEAR_MM)
+    };
+    let len = segment_len(seg);
+    let steps = if len > 0.0 {
+        (len / STEP_MM) as i32 / 2
+    } else {
+        0
+    };
+    for step in 0..=steps {
+        let shift = f64::from(step) * STEP_MM / len.max(f64::EPSILON);
+        for t in [0.5 - shift, 0.5 + shift] {
+            if (0.0..=1.0).contains(&t) && clear(at(t)) {
+                return at(t);
+            }
+        }
+    }
+    at(0.5)
+}
+
+/// Distance in mm from `p` to the segment `a`-`b`.
+fn point_to_segment_mm(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq == 0.0 {
+        0.0
+    } else {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq).clamp(0.0, 1.0)
+    };
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
 }
 
 /// A local label at `at_mm`, text anchored left. Same-named local
@@ -2889,6 +2959,22 @@ fn build_symbol_unit(
 
 #[cfg(test)]
 mod tests {
+    /// A name label on the midpoint of a wire joins any other net's wire that
+    /// crosses there, because KiCad connects a label to every wire under it.
+    #[test]
+    fn a_wire_name_label_keeps_off_a_wire_of_another_net() {
+        let bus = [(242.57, 31.75), (242.57, 67.31)];
+        let crossing = [(245.11, 49.53), (240.03, 49.53)];
+        let others: [&[(f64, f64)]; 1] = [&crossing];
+        let (x, y) = wire_name_label_at(&bus, &others);
+        assert!((x - 242.57).abs() < 1e-9, "the label stays on the wire");
+        assert!((31.75..=67.31).contains(&y), "the label stays on the wire");
+        assert!(
+            (y - 49.53).abs() > 0.5,
+            "the label at y {y} touches the crossing wire"
+        );
+    }
+
     use super::*;
     use std::path::Path;
     use synth_ir::lower;
