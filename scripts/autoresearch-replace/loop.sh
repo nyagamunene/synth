@@ -5,7 +5,7 @@
 set -u
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 cd "$(dirname "$0")/../.."
-MODEL=${MODEL:-deepseek/deepseek-v4.1-flash}
+MODEL=${MODEL:-opencode-go/deepseek-v4.1-flash}
 MAX_EXP=${MAX_EXP:-40}
 MAX_SECONDS=${MAX_SECONDS:-28800}
 MAX_DISCARDS=${MAX_DISCARDS:-10}
@@ -109,7 +109,7 @@ $(tail -n 8 $LOG)"
   alog=$LOGDIR/agent-$i.log
   t0=$SECONDS; tick=0
   dbg "agent log: $alog"
-  PATH="$GUARD:$PATH" setsid timeout 1800 cmd -p "$prompt" -m $MODEL --yolo --max-turns "${MAX_TURNS:-80}" --no-session >"$alog" 2>&1 &
+  PATH="$GUARD:$PATH" setsid timeout 1800 opencode run --auto --agent build --model "$MODEL" "$prompt" >"$alog" 2>&1 &
   pid=$!
   while kill -0 $pid 2>/dev/null; do
     sleep "$HEARTBEAT"
