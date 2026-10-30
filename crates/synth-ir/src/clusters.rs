@@ -551,6 +551,10 @@ impl Recognizer {
 
             // Decoupling capacitors, up to the declared count per rail.
             for rule in &part.required_decoupling {
+                // A capacitor behind a series part is not at this pin.
+                if rule.through.is_some() {
+                    continue;
+                }
                 let Some(pin_idx) = part.pins.iter().position(|p| p.name == rule.net) else {
                     continue;
                 };

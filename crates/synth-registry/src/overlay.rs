@@ -70,6 +70,16 @@ pub fn part_to_toml(part: &Part, header: &[&str]) -> String {
         if let Some(v) = c.max_current_ma {
             let _ = writeln!(out, "max_current_ma = {v}");
         }
+        for (key, value) in [
+            ("breakdown_voltage_v", c.breakdown_voltage_v),
+            ("breakdown_voltage_min_v", c.breakdown_voltage_min_v),
+            ("breakdown_voltage_max_v", c.breakdown_voltage_max_v),
+            ("breakdown_test_current_ma", c.breakdown_test_current_ma),
+        ] {
+            if let Some(v) = value {
+                let _ = writeln!(out, "{key} = {v}");
+            }
+        }
     }
     for pin in &part.pins {
         write_pin(&mut out, pin);
@@ -252,6 +262,8 @@ mod tests {
                 value: "100nf".into(),
                 count: 2,
                 max_distance_mm: Some(5.0),
+                to: None,
+                through: None,
             }],
             kicad_symbol: Some("Lib:Sym".into()),
             kicad_footprint: Some("Lib:Fp".into()),

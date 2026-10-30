@@ -93,10 +93,10 @@ number = "16"
 electrical_type = "passive"
 
 [[required_decoupling]]
-net = "vin"
+net = "in"
 value = "1uf"
 count = 1
 [[required_decoupling]]
-net = "vout"
+net = "out"
 value = "4.7uf"
 count = 1

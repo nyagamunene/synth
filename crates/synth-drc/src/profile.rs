@@ -164,6 +164,10 @@ impl ManufacturerProfile {
         }
     }
 
+    /// The built-in profiles that offer via-in-pad, by the name a board writes
+    /// in `manufacturer "<name>"`. The test beside this keeps it true.
+    pub const OFFERING_VIA_IN_PAD: &'static [&'static str] = &["jlc-filled-via"];
+
     /// Select a built-in profile by string name.
     ///
     /// The fabricator tiers match on a substring, because a board writes a
@@ -291,6 +295,28 @@ min_drill_to_copper_mm = 0.25
     /// Via-in-pad is a paid process option, so no standard tier may
     /// grant it by default: a board that has not asked for it and a
     /// fab that has not sold it must both read as "no".
+    /// Every name the list gives is a profile that really offers it, and no
+    /// built-in profile that offers it is missing from the list.
+    #[test]
+    fn the_list_of_profiles_offering_via_in_pad_is_true() {
+        for name in ManufacturerProfile::OFFERING_VIA_IN_PAD {
+            assert!(ManufacturerProfile::from_name(name).via_in_pad, "{name}");
+        }
+        for profile in [
+            ManufacturerProfile::jlc_standard(),
+            ManufacturerProfile::pcbway_standard(),
+            ManufacturerProfile::oshpark_4layer(),
+            ManufacturerProfile::jlc_filled_via(),
+        ] {
+            assert_eq!(
+                profile.via_in_pad,
+                ManufacturerProfile::OFFERING_VIA_IN_PAD.contains(&profile.name.as_str()),
+                "{}",
+                profile.name
+            );
+        }
+    }
+
     #[test]
     fn the_standard_tiers_do_not_offer_via_in_pad() {
         for profile in [

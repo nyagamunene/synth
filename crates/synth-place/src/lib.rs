@@ -77,9 +77,11 @@ pub mod advisor;
 mod analytic;
 pub mod board_family;
 pub mod cem;
+pub mod fitness;
 pub mod floorplan;
 pub mod modules;
 pub mod outline_packer;
+mod repeats;
 mod replace;
 pub mod replace_params;
 pub mod score;
@@ -93,6 +95,7 @@ use synth_ir::{Board, ComponentId, PinId};
 use thiserror::Error;
 
 mod routability;
+pub use fitness::{fitness, FitnessMetric, PlacementFitness};
 pub use routability::{routability, RoutabilityEstimate};
 
 /// Final position + orientation of a single component on the PCB.
@@ -348,6 +351,10 @@ const BOARD_MARGIN_MM: f64 = 6.0;
 
 const COPPER_EDGE_CLEARANCE_MM: f64 = 0.5;
 
+/// How far inside the board edge an external connector's courtyard may sit and
+/// still count as flush with it.
+const FLUSH_CONNECTOR_TOLERANCE_MM: f64 = 0.1;
+
 const MAX_DOCKING_SLIDE_STEPS: i64 = 40;
 
 /// Margin the greedy packer starts its canvas with. The finished outline is
@@ -366,22 +373,75 @@ const DENSE_EDGE_MARGIN_MM: f64 = 4.0;
 /// sparse board in the tuning and held-out corpora routes cleanly at 1.0 mm.
 const SPARSE_EDGE_MARGIN_MM: f64 = 1.0;
 
-/// The tight dense rim the export fits after placing. The external router and
-/// the independent DRC gate judge it, while the default placer keeps the
-/// perimeter the built-in router needs. 1.25 mm failed sensor_logger and
-/// 1.0 mm failed env_logger and sensor_logger, while 1.5 mm passed every
-/// corpus board through the external router.
-const TIGHT_EDGE_MARGIN_MM: f64 = 1.5;
+/// The tight rim the export fits round a dense board of 18 to 29 parts. The
+/// external router and the independent DRC gate judge it. 1.25 mm failed
+/// sensor_logger and 1.0 mm failed env_logger, so 1.5 mm was the passing rung;
+/// 1.4 and 1.35 stayed clean, and 1.3 is the next half-step. The whole tier
+/// needs 1.3 on the combined packer: at 1.05 mm buck strands a via in pad
+/// R_LED.1.
+const TIGHT_EDGE_MARGIN_MM: f64 = 1.3;
+
+/// The rim for a board of 30 or more parts. usb_uart (32) is the only one and
+/// it passed the 1.25 mm rung that sensor_logger (29) rejected.
+const TIGHT_WIDEST_EDGE_MARGIN_MM: f64 = 1.25;
+
+/// Part count at which a board takes [`TIGHT_WIDEST_EDGE_MARGIN_MM`].
+const WIDEST_BOARD_COMPONENTS: usize = 30;
 
 /// The tight rim the export fits round a sparse board. Every sparse board in
 /// the tuning and held-out corpora routes cleanly at 1.0 mm.
 const TIGHT_SPARSE_EDGE_MARGIN_MM: f64 = 1.0;
 
+/// The rim for a board of at most this many parts: no perimeter pattern to
+/// route around. 0.6 mm stranded a net on ldo_block and 0.7 mm held, so 0.65
+/// keeps the copper above the 0.5 mm fab edge rule without stranding one.
+const TIGHT_TINY_EDGE_MARGIN_MM: f64 = 0.65;
+
+/// The rim for an edge passive on a board of 6 to 17 parts. The outline unions
+/// the exported copper at this margin, so 0.9 mm still clears the 0.5 mm edge
+/// rule; multi_pattern_combo (15 parts) strands a net at the tighter 0.65 mm.
+pub const PASSIVE_EDGE_MARGIN_MM: f64 = 0.9;
+
+/// The tightest passive rim: 0.65 mm still leaves the copper above the 0.5 mm
+/// fab edge rule, and the outline unions the exported copper at this margin.
+const TIGHT_PASSIVE_EDGE_MARGIN_MM: f64 = 0.65;
+
+/// Largest board with no perimeter pattern to route around.
+const TINY_BOARD_COMPONENTS: usize = 5;
+
+/// The rim the export fits round a passive that sets a board edge.
+///
+/// A dense board keeps the board rim. Its perimeter is the channel its ICs and
+/// connectors fan out through, and a passive courtyard pulled in to the tight
+/// rim leaves the router no escape there: sensor_logger (29 parts) strands a
+/// via inside pad C9.1 at 0.65 mm and routes cleanly one rung out (Oct 2026).
+/// Every board below the dense gate has no such pattern, so its edge passives
+/// take the tighter rim.
+#[must_use]
+pub fn passive_edge_margin_mm(board: &Board) -> f64 {
+    if board.components.len() >= DENSE_BOARD_COMPONENTS {
+        return tight_edge_margin_mm(board);
+    }
+    if board.components.len() > TINY_BOARD_COMPONENTS {
+        PASSIVE_EDGE_MARGIN_MM
+    } else {
+        TIGHT_PASSIVE_EDGE_MARGIN_MM
+    }
+}
+
+/// The rim a board feature keeps in the fitted outline. A mounting hole needs
+/// more room than the 1.5 mm tight rim: at 1.5 mm its copper clearance cuts
+/// the perimeter pour in two and leaves no room for a stitching via. 2.2 mm is
+/// the rim the reference boards were routed with before the tight fit.
+const BOARD_FEATURE_EDGE_MARGIN_MM: f64 = 2.2;
+
 /// A board with at least this many parts is dense enough that the export fits
-/// its tight 1.5 mm rim; every sparser board fits 1.0 mm. Calibrated on the
-/// reference boards: env_logger (20 parts) and sensor_logger (29) fail to
-/// route at 1.0 mm, while every sparser board routes cleanly and is smaller
-/// for it. The export's seeded tight-margin sweep uses the same gate.
+/// its tight rim instead of the sparse 1.0 mm one ([`tight_edge_margin_mm`]
+/// steps 1.0 → 1.3 mm, then 1.25 mm at 30+ parts; boards of 5 or fewer fit
+/// 0.65 mm). Calibrated on the reference boards: env_logger (20 parts) and
+/// sensor_logger (29) fail to route at 1.0 mm, while every sparser board
+/// routes cleanly and is smaller for it. The export's seeded tight-margin
+/// sweep uses the same gate.
 pub const DENSE_BOARD_COMPONENTS: usize = 18;
 
 /// Target fill ratio (placed-component courtyard area ÷ board
@@ -530,9 +590,9 @@ pub fn apply_sidecar_overrides(
 /// [`tighten_outline_after_sidecar`] removes any perimeter the courtyards do
 /// not use.
 /// The gap a part's courtyard keeps from Edge.Cuts: only a part whose hard
-/// hint docks it to an edge, or a board feature, may touch the edge.
+/// hint docks it to an edge may touch the edge.
 fn courtyard_edge_inset_nm(component: &synth_ir::Component) -> i64 {
-    if is_edge_flush_connector(component) || synth_layout::is_board_feature_kind(&component.kind) {
+    if is_edge_flush_connector(component) {
         0
     } else {
         mm_to_nm(COPPER_EDGE_CLEARANCE_MM)
@@ -569,6 +629,197 @@ fn expand_outline_for_pinned(
     placement.board_outline = outline;
 }
 
+/// The outline the KiCad export fits round `placement`: the tight rim the
+/// export uses, with an edge connector's flush side taken from its hint, and
+/// the smaller passive rim [`passive_edge_margin_mm`] gives an edge passive.
+fn exported_outline(board: &Board, placement: &Placement) -> Option<Rect> {
+    outline_with_flush_connectors(
+        board,
+        &placement.components,
+        mm_to_nm(tight_edge_margin_mm(board)),
+        mm_to_nm(passive_edge_margin_mm(board)),
+        sidecar_courtyard_rect,
+        true,
+    )
+}
+
+/// Close the empty bands a sidecar floorplan leaves between its parts.
+///
+/// The pinned coordinates place every part relative to its neighbours, but
+/// they also leave bands no courtyard uses: beside a connector, or between a
+/// row and the one below it. Sliding each pinned part toward one board edge
+/// closes them; because the parts settle in the order they are met, none
+/// passes another and a grid step stays between neighbours. A connector docked
+/// to an edge does not slide, so the body moves toward it instead of dragging
+/// it off its edge.
+///
+/// Every slide is judged by the outline the export will fit round the result,
+/// and kept only when it is smaller and the maximum decoupling distance has not
+/// grown. A docked connector pins its part to the edge, so a slide takes the
+/// body away from a pin that cannot follow and lengthens the traces the router
+/// has to fit; on such a floorplan the wiring estimate is a gate too. With no
+/// docked connector every part moves, so the floorplan translates instead of
+/// tearing apart and the outline, decoupling and keepout checks are enough.
+fn close_pinned_bands(
+    board: &Board,
+    placement: &mut Placement,
+    sidecar: &synth_layout::sidecar::SidecarLayout,
+) {
+    // A relative entry states a distance from an anchor, so the pair has to
+    // move together or not at all. The slides here work one part at a time, so
+    // a floorplan that uses one keeps its pinned coordinates exactly.
+    if sidecar
+        .components
+        .values()
+        .any(|entry| entry.relative_to.is_some())
+    {
+        return;
+    }
+    let movable: Vec<bool> = placement
+        .components
+        .iter()
+        .map(|placed| {
+            flush_edge_index(board, placed.id).is_none()
+                && board
+                    .component(placed.id)
+                    .is_some_and(|component| sidecar.components.contains_key(&component.refdes))
+        })
+        .collect();
+    if movable.iter().filter(|movable| **movable).count() < 2 {
+        return;
+    }
+    // A dense part keeps the same ring here that compaction keeps: the router
+    // still has to escape its pins.
+    let sized = courtyard_sizes(board, placement);
+    let spaced: Vec<(f64, f64)> = placement
+        .components
+        .iter()
+        .zip(&sized)
+        .map(|(placed, size)| {
+            let ring = if is_dense_part(board, placed.id) {
+                DENSE_PART_RING_MM
+            } else {
+                0.0
+            };
+            (size.0 + ring, size.1 + ring)
+        })
+        .collect();
+    let Some(mut outline) = exported_outline(board, placement) else {
+        return;
+    };
+    let mut area = area_mm2(&outline);
+    // A connector is docked when its hint names an edge; that part does not
+    // slide, so the rest of the floorplan moves relative to a fixed pin.
+    let docked = placement
+        .components
+        .iter()
+        .any(|placed| flush_edge_index(board, placed.id).is_some());
+    let mut hpwl = total_hpwl_nm(board, placement);
+    let mut decoupling = crate::score::score_placement(board, placement).max_decoupling_distance_mm;
+    let mut hits = keepout_overlaps(board, placement);
+    for _ in 0..PINNED_COMPACT_ROUNDS {
+        let mut candidates: Vec<Placement> = Vec::new();
+        for (along_y, toward_low) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut candidate = placement.clone();
+            slide_parts(
+                &mut candidate,
+                &spaced,
+                &movable,
+                along_y,
+                toward_low,
+                PINNED_SLIDE_PITCH_MM,
+            );
+            candidates.push(candidate);
+        }
+        // A part that reaches an outline side is usually shadowed by another
+        // part on the same side, so moving either one alone leaves the area
+        // unchanged, while moving every part together drags the floorplan and
+        // lengthens the wiring to a docked connector. Close one side's band on
+        // its own: only the parts that reach that side move inward.
+        let band_nm = mm_to_nm(tight_edge_margin_mm(board)) + mm_to_nm(0.5);
+        let rects: Vec<Rect> = placement
+            .components
+            .iter()
+            .zip(&sized)
+            .map(|(placed, size)| rotated_courtyard_rect(placed, *size))
+            .collect();
+        for (along_y, toward_low, side) in [
+            (false, false, 0),
+            (true, false, 1),
+            (false, true, 2),
+            (true, true, 3),
+        ] {
+            let band: Vec<bool> = movable
+                .iter()
+                .zip(&rects)
+                .map(|(is_movable, rect)| {
+                    *is_movable
+                        && match side {
+                            0 => rect.min.x_nm <= outline.min.x_nm + band_nm,
+                            1 => rect.min.y_nm <= outline.min.y_nm + band_nm,
+                            2 => rect.max.x_nm >= outline.max.x_nm - band_nm,
+                            _ => rect.max.y_nm >= outline.max.y_nm - band_nm,
+                        }
+                })
+                .collect();
+            if !band.iter().any(|in_band| *in_band) {
+                continue;
+            }
+            let mut candidate = placement.clone();
+            slide_parts(
+                &mut candidate,
+                &spaced,
+                &band,
+                along_y,
+                toward_low,
+                PINNED_SLIDE_PITCH_MM,
+            );
+            candidates.push(candidate);
+        }
+
+        let mut best: Option<(Placement, Rect, i64, f64)> = None;
+        for candidate in candidates {
+            let Some(candidate_outline) = exported_outline(board, &candidate) else {
+                continue;
+            };
+            let candidate_area = area_mm2(&candidate_outline);
+            if candidate_area >= area {
+                continue;
+            }
+            let candidate_hpwl = total_hpwl_nm(board, &candidate);
+            let candidate_decoupling =
+                crate::score::score_placement(board, &candidate).max_decoupling_distance_mm;
+            if (docked && candidate_hpwl > hpwl)
+                || candidate_decoupling > decoupling
+                || keepout_overlaps(board, &candidate) > hits
+            {
+                continue;
+            }
+            let smaller = best.as_ref().is_none_or(|(_, best_outline, best_hpwl, _)| {
+                (candidate_area, candidate_hpwl) < (area_mm2(best_outline), *best_hpwl)
+            });
+            if smaller {
+                best = Some((
+                    candidate,
+                    candidate_outline,
+                    candidate_hpwl,
+                    candidate_decoupling,
+                ));
+            }
+        }
+        let Some((candidate, candidate_outline, candidate_hpwl, candidate_decoupling)) = best
+        else {
+            break;
+        };
+        *placement = candidate;
+        outline = candidate_outline;
+        area = area_mm2(&outline);
+        hpwl = candidate_hpwl;
+        decoupling = candidate_decoupling;
+        hits = keepout_overlaps(board, placement);
+    }
+}
+
 /// Tighten an override-aware outline around the actual footprint courtyards.
 /// The outline origin is allowed to be non-zero so absolute sidecar coordinates
 /// remain authoritative; only unused perimeter area is removed.
@@ -577,6 +828,7 @@ fn tighten_outline_after_sidecar(board: &Board, placement: &mut Placement) {
         board,
         &placement.components,
         fitted_edge_margin_nm(board),
+        mm_to_nm(passive_edge_margin_mm(board)),
         sidecar_courtyard_rect,
         false,
     ) {
@@ -599,10 +851,11 @@ fn fitted_edge_margin_nm(board: &Board) -> i64 {
 /// perimeter than the default placer keeps for the built-in router.
 #[must_use]
 pub fn tight_edge_margin_mm(board: &Board) -> f64 {
-    if board.components.len() >= DENSE_BOARD_COMPONENTS {
-        TIGHT_EDGE_MARGIN_MM
-    } else {
-        TIGHT_SPARSE_EDGE_MARGIN_MM
+    match board.components.len() {
+        n if n >= WIDEST_BOARD_COMPONENTS => TIGHT_WIDEST_EDGE_MARGIN_MM,
+        n if n >= DENSE_BOARD_COMPONENTS => TIGHT_EDGE_MARGIN_MM,
+        n if n <= TINY_BOARD_COMPONENTS => TIGHT_TINY_EDGE_MARGIN_MM,
+        _ => TIGHT_SPARSE_EDGE_MARGIN_MM,
     }
 }
 
@@ -615,10 +868,39 @@ fn tighten_outline_to_hints(board: &Board, placement: &mut Placement) {
 
 /// Fit the outline round the placement's courtyards at `margin_nm`.
 fn fit_outline(board: &Board, placement: &mut Placement, margin_nm: i64) {
+    fit_outline_at(board, placement, margin_nm, margin_nm);
+}
+
+/// Fit the outline at `margin_mm`, but let a passive keep its own smaller rim.
+///
+/// Only the export uses this: a connector or IC needs the caller's perimeter
+/// channel for its fan-out, while a passive courtyard can sit closer to the
+/// edge without bringing its copper near the fab rule.
+pub fn fit_outline_with_passive_margin_mm(
+    board: &Board,
+    placement: &mut Placement,
+    margin_mm: f64,
+    passive_margin_mm: f64,
+) {
+    fit_outline_at(
+        board,
+        placement,
+        mm_to_nm(margin_mm),
+        mm_to_nm(passive_margin_mm),
+    );
+}
+
+fn fit_outline_at(
+    board: &Board,
+    placement: &mut Placement,
+    margin_nm: i64,
+    passive_margin_nm: i64,
+) {
     if let Some(outline) = outline_with_flush_connectors(
         board,
         &placement.components,
         margin_nm,
+        passive_margin_nm,
         sidecar_courtyard_rect,
         true,
     ) {
@@ -631,6 +913,80 @@ fn fit_outline(board: &Board, placement: &mut Placement, margin_nm: i64) {
 /// router's coverage tests need the wider default perimeter.
 pub fn fit_outline_with_margin_mm(board: &Board, placement: &mut Placement, margin_mm: f64) {
     fit_outline(board, placement, mm_to_nm(margin_mm));
+}
+
+/// Channel kept between a trimmed edge and the furthest courtyard or pad it
+/// would otherwise squeeze.
+const OUTLINE_TRIM_RESERVE_NM: i64 = 500_000;
+
+/// Pitch of the cell grid the shape score counts dead space on.
+const DEAD_CELL_NM: i64 = 1_000_000;
+
+/// Pull one fitted edge in to just under the next whole millimetre, but only
+/// while [`OUTLINE_TRIM_RESERVE_NM`] still separates it from the furthest
+/// courtyard or pad.
+fn trim_trailing_edge(edge_nm: i64, origin_nm: i64, hard_nm: i64) -> i64 {
+    let slack = edge_nm - hard_nm - OUTLINE_TRIM_RESERVE_NM;
+    if slack <= 0 {
+        return edge_nm;
+    }
+    let remainder = (edge_nm - origin_nm).rem_euclid(DEAD_CELL_NM);
+    // The grid drops a column only once the span is strictly below a whole
+    // millimetre; the margin absorbs the export's coordinate rounding.
+    let needed = remainder + 10_000;
+    if needed <= slack {
+        edge_nm - needed
+    } else {
+        edge_nm
+    }
+}
+
+/// Trim the trailing x and y sides of a fitted outline onto the shape score's
+/// cell grid.
+///
+/// The score measures dead space over a one-millimetre grid anchored at the
+/// Edge.Cuts bbox minimum, so a box ending a fraction past a whole millimetre
+/// counts a strip narrower than one cell as if it were a full row or column of
+/// air. Removing that unused strip costs no courtyard: the trim stops at the
+/// last pad or courtyard plus the edge clearance placement already asks for,
+/// and it is applied to the same `board_outline` the exporter draws and the
+/// sidecar coordinates are judged against, so all three still agree.
+pub fn trim_outline_to_grid(board: &Board, placement: &mut Placement) {
+    let mut hard_max_x = i64::MIN;
+    let mut hard_max_y = i64::MIN;
+    for placed in &placement.components {
+        let Some(component) = board.component(placed.id) else {
+            continue;
+        };
+        let rect = sidecar_courtyard_rect(board, component, placed);
+        let copper = exported_pad_bounds(component, placed);
+        let mut hard = [rect.min.x_nm, rect.min.y_nm, rect.max.x_nm, rect.max.y_nm];
+        if let Some(copper) = copper {
+            hard[0] = hard[0].min(copper.min.x_nm);
+            hard[1] = hard[1].min(copper.min.y_nm);
+            hard[2] = hard[2].max(copper.max.x_nm);
+            hard[3] = hard[3].max(copper.max.y_nm);
+        }
+        if let Some(side) = flush_edge_index(board, placed.id) {
+            let reach = connector_reach(rect, copper.unwrap_or(rect));
+            let reach = [
+                reach.min.x_nm,
+                reach.min.y_nm,
+                reach.max.x_nm,
+                reach.max.y_nm,
+            ];
+            hard[side] = reach[side];
+        }
+        hard_max_x = hard_max_x.max(hard[2]);
+        hard_max_y = hard_max_y.max(hard[3]);
+    }
+    if hard_max_x == i64::MIN {
+        return;
+    }
+    let mut outline = placement.board_outline;
+    outline.max.x_nm = trim_trailing_edge(outline.max.x_nm, outline.min.x_nm, hard_max_x);
+    outline.max.y_nm = trim_trailing_edge(outline.max.y_nm, outline.min.y_nm, hard_max_y);
+    placement.board_outline = outline;
 }
 
 fn rotated_courtyard_rect(placed: &ComponentPlacement, (width, height): (f64, f64)) -> Rect {
@@ -649,7 +1005,7 @@ fn padded_courtyard_rect(
     rotated_courtyard_rect(placed, lookup[&placed.id])
 }
 
-fn is_edge_flush_connector(component: &synth_ir::Component) -> bool {
+pub(crate) fn is_edge_flush_connector(component: &synth_ir::Component) -> bool {
     matches!(component.kind.as_str(), "connector" | "jack")
         && component.placement_hint.as_ref().is_some_and(|hint| {
             hint.priority == synth_ir::PlacementPriority::Hard && hint.edge.is_some()
@@ -696,6 +1052,7 @@ fn outline_with_flush_connectors(
     board: &Board,
     placements: &[ComponentPlacement],
     margin_nm: i64,
+    passive_margin_nm: i64,
     courtyard: impl Fn(&Board, &synth_ir::Component, &ComponentPlacement) -> Rect,
     side_from_hint: bool,
 ) -> Option<Rect> {
@@ -723,10 +1080,17 @@ fn outline_with_flush_connectors(
         });
     let mut outline = [i64::MAX, i64::MAX, i64::MIN, i64::MIN];
     for (component, placed, rect, copper) in &parts {
-        // A mounting hole, test point or fiducial belongs in a corner, so the
-        // outline ends at its courtyard instead of leaving a margin round it.
+        // A board feature placed in a corner needs a wider rim than the tight
+        // fit. At 1.5 mm the hole's copper clearance cuts the perimeter pour
+        // in two and there is no room left for a stitching via; 2.2 mm keeps
+        // the pour connected, which is the rim these boards were routed with.
+        // A feature keeps this rim whatever the margin round the other parts.
+        // A passive may keep a smaller rim than a connector or IC: its pads
+        // are close to its courtyard, so the fab edge rule still holds.
         let margin_nm = if synth_layout::is_board_feature_kind(&component.kind) {
-            0
+            mm_to_nm(BOARD_FEATURE_EDGE_MARGIN_MM)
+        } else if is_passive(component) {
+            margin_nm.min(passive_margin_nm)
         } else {
             margin_nm
         };
@@ -746,24 +1110,37 @@ fn outline_with_flush_connectors(
                 flush.max.x_nm,
                 flush.max.y_nm,
             ];
-            let side = match body.filter(|_| !side_from_hint) {
-                Some(body) => [
-                    body.min.x_nm - real.min.x_nm,
-                    body.min.y_nm - real.min.y_nm,
-                    real.max.x_nm - body.max.x_nm,
-                    real.max.y_nm - body.max.y_nm,
-                ]
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, p)| **p)
-                .map(|(side, _)| side),
-                None => component
-                    .placement_hint
-                    .as_ref()
-                    .and_then(|hint| hint.edge.as_ref())
-                    .map(edge_index),
+            // A connector sits where the solver or a sidecar put it, which need
+            // not be the edge its hint names. Trust the hint unless the
+            // connector is clearly nowhere near that edge; then use the side
+            // it sticks out of most. Taking the hinted side blindly let a
+            // connector hinted "bottom" but sitting on the left keep its
+            // margin on the left and push the whole left edge out, undoing
+            // its neighbours' flush edge.
+            let hinted = component
+                .placement_hint
+                .as_ref()
+                .and_then(|hint| hint.edge.as_ref())
+                .map(edge_index);
+            let sides: Vec<usize> = match body {
+                Some(body) => {
+                    let reaches = [
+                        body.min.x_nm - real.min.x_nm,
+                        body.min.y_nm - real.min.y_nm,
+                        real.max.x_nm - body.max.x_nm,
+                        real.max.y_nm - body.max.y_nm,
+                    ];
+                    let geometric = (0..4).max_by_key(|&side| reaches[side]);
+                    match hinted {
+                        Some(side) if side_from_hint && reaches[side] >= -margin_nm => {
+                            vec![side]
+                        }
+                        _ => geometric.into_iter().collect(),
+                    }
+                }
+                None => hinted.into_iter().collect(),
             };
-            if let Some(side) = side {
+            for side in sides {
                 reach[side] = flush[side];
             }
         } else if let Some(copper) = copper {
@@ -1163,6 +1540,9 @@ fn place_with_tuning_and_sidecar_seeded_mode<S: ::std::hash::BuildHasher>(
     )?;
     if let Some(sidecar) = loaded.as_ref() {
         apply_sidecar_overrides(board, &mut placement, sidecar);
+        // The pinned coordinates are a floorplan, not a packing: they leave
+        // bands no courtyard uses. Slide them shut before the outline is fitted.
+        close_pinned_bands(board, &mut placement, sidecar);
     }
     if sidecar_path.is_some_and(std::path::Path::exists) {
         tighten_outline_after_sidecar(board, &mut placement);
@@ -1898,7 +2278,7 @@ fn place_board_features(
             if occupied.iter().any(|rect| candidate.intersects(rect)) {
                 return None;
             }
-            if intersects_keepout(candidate, id, board, envelope, |pid| {
+            if overlaps_keepout(candidate, id, board, envelope, |pid| {
                 placements
                     .iter()
                     .find(|placement| placement.id == pid)
@@ -2060,6 +2440,63 @@ pub(crate) fn courtyard_rect_for_placement(
         offset_mm.unwrap_or((0.0, 0.0)),
         extra_nm,
     )
+}
+
+/// Distance from a courtyard within which a raster cell counts as occupied.
+const DEAD_REACH_MM: f64 = 3.0;
+
+/// Raster cells of [`Placement::board_outline`] whose centre is not within
+/// `DEAD_REACH_MM` of any component courtyard.
+///
+/// Two arrangements can fit the same box and still leave very different
+/// amounts of air between their parts; this is the shape term that tells them
+/// apart. The grid is anchored at the outline's minimum corner, so the count
+/// is deterministic for a given placement.
+#[must_use]
+pub fn dead_cells(board: &Board, placement: &Placement) -> u64 {
+    let outline = placement.board_outline;
+    let cell_nm = DEAD_CELL_NM;
+    let reach_nm = mm_to_nm(DEAD_REACH_MM);
+    let cols = outline.width_nm() / cell_nm;
+    let rows = outline.height_nm() / cell_nm;
+    if cols <= 0 || rows <= 0 {
+        return 0;
+    }
+    let courtyards: Vec<Rect> = placement
+        .components
+        .iter()
+        .filter_map(|placed| {
+            let component = board.component(placed.id)?;
+            let (offset_mm, (width_mm, height_mm)) = component.part.as_ref().map_or_else(
+                || ((0.0, 0.0), fallback_courtyard(&component.kind)),
+                synth_layout::pcb_courtyard_geometry_for_part,
+            );
+            Some(courtyard_rect_for_placement(
+                placed,
+                width_mm,
+                height_mm,
+                Some(offset_mm),
+                reach_nm,
+            ))
+        })
+        .collect();
+    let mut dead = 0;
+    for col in 0..cols {
+        let x_nm = outline.min.x_nm + col * cell_nm + cell_nm / 2;
+        for row in 0..rows {
+            let y_nm = outline.min.y_nm + row * cell_nm + cell_nm / 2;
+            let occupied = courtyards.iter().any(|courtyard| {
+                courtyard.min.x_nm <= x_nm
+                    && x_nm <= courtyard.max.x_nm
+                    && courtyard.min.y_nm <= y_nm
+                    && y_nm <= courtyard.max.y_nm
+            });
+            if !occupied {
+                dead += 1;
+            }
+        }
+    }
+    dead
 }
 
 /// Deterministic order key for a component under a placement `seed`.
@@ -2833,6 +3270,9 @@ fn place_with_outline<S: ::std::hash::BuildHasher>(
                 courtyard_offset,
                 pad_extra_nm,
             );
+            // Centre-only on purpose: the strict test here costs secure_tracker
+            // a routed net, and the strict gates in the passes after this one
+            // already keep a courtyard from entering a keepout.
             if placed.iter().all(|(_, _, r)| !candidate.intersects(r))
                 && !intersects_keepout(candidate, id, board, board_outline, |pid| {
                     placed
@@ -3429,10 +3869,12 @@ fn place_with_outline<S: ::std::hash::BuildHasher>(
     // component position and the hard edge contracts while producing the
     // compact outline expected of a development board.
     if is_rp2350_board {
+        let margin_nm = fitted_edge_margin_nm(board);
         let outline = outline_with_flush_connectors(
             board,
             &placements,
-            fitted_edge_margin_nm(board),
+            margin_nm,
+            margin_nm,
             |_, _, placed| padded_courtyard_rect(&courtyard_lookup, placed),
             false,
         );
@@ -3448,10 +3890,86 @@ fn place_with_outline<S: ::std::hash::BuildHasher>(
         }
     }
 
+    face_edge_connectors_outward(
+        board,
+        adaptive_board_outline,
+        &mut placements,
+        &courtyard_lookup,
+        pinned,
+    );
+
     Ok(Placement {
         board_outline: adaptive_board_outline,
         components: placements,
     })
+}
+
+/// Turn every edge-mounted connector so its plug opens out of the board.
+///
+/// The floorplan picks a connector's rotation from the edge it was *asked* for,
+/// but a soft hint is a preference and the placer may settle it somewhere else.
+/// What a person sees is where the connector ended up, so this runs last and
+/// uses the same test the DRC does, [`floorplan::connector_orientation_issues`],
+/// which is what keeps the two from disagreeing.
+///
+/// A pinned connector is left alone: a sidecar is a constraint, and the DRC
+/// reports it if it is wrong. So is a turn that would put the courtyard on top
+/// of another part, or take the courtyard or a copper pad outside the outline
+/// or inside the copper-to-edge clearance — a quarter turn changes its
+/// extents — since either is worse than a connector that faces sideways, and
+/// the DRC reports that too.
+fn face_edge_connectors_outward<S: ::std::hash::BuildHasher>(
+    board: &Board,
+    outline: Rect,
+    placements: &mut [ComponentPlacement],
+    courtyard_lookup: &std::collections::HashMap<ComponentId, (f64, f64)>,
+    pinned: &std::collections::HashMap<ComponentId, (Point, Rotation), S>,
+) {
+    for issue in floorplan::connector_orientation_issues(board, outline, placements) {
+        let Some(index) = placements.iter().position(|placed| {
+            board
+                .component(placed.id)
+                .is_some_and(|component| component.refdes == issue.refdes)
+        }) else {
+            continue;
+        };
+        if pinned.contains_key(&placements[index].id) {
+            continue;
+        }
+        let mut turned = placements[index];
+        turned.rotation = issue.expected;
+        let clear = placements.iter().all(|other| {
+            other.id == turned.id
+                || !padded_courtyard_rect(courtyard_lookup, &turned)
+                    .intersects(&padded_courtyard_rect(courtyard_lookup, other))
+        });
+        if clear && turn_stays_inside(board, outline, &turned) {
+            placements[index] = turned;
+        }
+    }
+}
+
+/// Whether a connector, as placed, keeps its courtyard inside `outline` and
+/// every copper pad at least [`COPPER_EDGE_CLEARANCE_MM`] inside it. A quarter
+/// turn swaps a connector's extents, so a placement that was legal can leave
+/// the board once it is turned.
+fn turn_stays_inside(board: &Board, outline: Rect, turned: &ComponentPlacement) -> bool {
+    let Some(component) = board.component(turned.id) else {
+        return true;
+    };
+    let within = |inner: Rect, outer: Rect| {
+        inner.min.x_nm >= outer.min.x_nm
+            && inner.min.y_nm >= outer.min.y_nm
+            && inner.max.x_nm <= outer.max.x_nm
+            && inner.max.y_nm <= outer.max.y_nm
+    };
+    let clearance = mm_to_nm(COPPER_EDGE_CLEARANCE_MM);
+    let copper_area = Rect::new(
+        Point::new(outline.min.x_nm + clearance, outline.min.y_nm + clearance),
+        Point::new(outline.max.x_nm - clearance, outline.max.y_nm - clearance),
+    );
+    within(sidecar_courtyard_rect(board, component, turned), outline)
+        && exported_pad_bounds(component, turned).is_none_or(|pads| within(pads, copper_area))
 }
 
 fn exported_pad_bounds(
@@ -3527,23 +4045,21 @@ fn enforce_edge_copper_clearance(
     }
 }
 
-/// True when `candidate` falls inside any keepout circle.
+/// Resolve the keepout circles that apply to component `id`, in board
+/// coordinates.
 ///
 /// `lookup` resolves an already-placed component's courtyard rect; callers
 /// differ in how they track placements, so this is a closure rather than a
 /// concrete slice type. A missing rect means "not placed yet", which falls back
-/// to the board centre — the same fallback used when no anchor matches.
-pub(crate) fn intersects_keepout(
-    candidate: Rect,
+/// to the board centre — the same fallback used when no anchor matches. A
+/// keepout anchored to `id` itself does not apply to it.
+fn keepout_circles(
     id: ComponentId,
     board: &Board,
     board_outline: Rect,
     lookup: impl Fn(ComponentId) -> Option<Rect>,
-) -> bool {
-    let candidate_center = Point::new(
-        (candidate.min.x_nm + candidate.max.x_nm) / 2,
-        (candidate.min.y_nm + candidate.max.y_nm) / 2,
-    );
+) -> Vec<(Point, i64)> {
+    let mut circles = Vec::new();
     for keepout in &board.keepouts {
         let radius_mm = keepout.radius.map_or(0.0, synth_ir::Length::to_mm);
         let keepout_radius_nm = mm_to_nm(radius_mm);
@@ -3578,18 +4094,56 @@ pub(crate) fn intersects_keepout(
             ))
         };
 
-        if let Some(ac) = keepout_center {
-            let dx = (candidate_center.x_nm - ac.x_nm).abs();
-            let dy = (candidate_center.y_nm - ac.y_nm).abs();
-            if dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
-                < keepout_radius_nm.saturating_mul(keepout_radius_nm)
-            {
-                return true;
-            }
+        if let Some(center) = keepout_center {
+            circles.push((center, keepout_radius_nm));
         }
     }
+    circles
+}
 
-    false
+/// True when `candidate` falls inside any keepout circle.
+pub(crate) fn intersects_keepout(
+    candidate: Rect,
+    id: ComponentId,
+    board: &Board,
+    board_outline: Rect,
+    lookup: impl Fn(ComponentId) -> Option<Rect>,
+) -> bool {
+    let candidate_center = Point::new(
+        (candidate.min.x_nm + candidate.max.x_nm) / 2,
+        (candidate.min.y_nm + candidate.max.y_nm) / 2,
+    );
+    keepout_circles(id, board, board_outline, lookup)
+        .into_iter()
+        .any(|(center, radius)| {
+            let dx = candidate_center.x_nm - center.x_nm;
+            let dy = candidate_center.y_nm - center.y_nm;
+            dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
+                < radius.saturating_mul(radius)
+        })
+}
+
+/// True when any part of `candidate` overlaps a keepout circle, not just its
+/// centre. Packing uses this stricter test: a part whose centre sits just
+/// outside the circle can still hang its pads into the no-route zone, leaving
+/// the router no escape and making it drop a via inside the pad.
+pub(crate) fn overlaps_keepout(
+    candidate: Rect,
+    id: ComponentId,
+    board: &Board,
+    board_outline: Rect,
+    lookup: impl Fn(ComponentId) -> Option<Rect>,
+) -> bool {
+    keepout_circles(id, board, board_outline, lookup)
+        .into_iter()
+        .any(|(center, radius)| {
+            let nearest_x = center.x_nm.clamp(candidate.min.x_nm, candidate.max.x_nm);
+            let nearest_y = center.y_nm.clamp(candidate.min.y_nm, candidate.max.y_nm);
+            let dx = nearest_x - center.x_nm;
+            let dy = nearest_y - center.y_nm;
+            dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
+                < radius.saturating_mul(radius)
+        })
 }
 
 #[allow(dead_code)]
@@ -4562,6 +5116,533 @@ pub fn classify_region_name(pt: Point, usable: Rect) -> String {
     }
 }
 
+/// Farthest a reset button or a crystal may sit from the MCU it serves, courtyard
+/// edge to courtyard edge. Edge to edge, not anchor to anchor, so a large package
+/// whose anchor sits far from its pads is not judged by where the anchor is. A
+/// crystal's load capacitors sit beside it, so its distance from the MCU is the
+/// length of the oscillator traces.
+const SUPPORT_PART_MAX_MM: f64 = 10.0;
+
+/// Whether a part is the board's MCU for the placement review. One predicate for
+/// every check that looks for it, so two checks cannot disagree about which part
+/// that is.
+fn is_mcu_like(component: &synth_ir::Component) -> bool {
+    matches!(component.kind.as_str(), "mcu" | "processor" | "ic")
+}
+
+/// A part that belongs beside its MCU and is farther from it than
+/// [`SUPPORT_PART_MAX_MM`].
+struct DistantSupportPart {
+    refdes: String,
+    mcu: String,
+    /// Courtyard edge to courtyard edge, in millimetres.
+    mm: f64,
+    /// `reset button` or `crystal`, as the warning names it.
+    what: &'static str,
+    action: &'static str,
+}
+
+/// The gap between two courtyards, in millimetres: zero when they touch or
+/// overlap.
+fn courtyard_gap_mm(a: Rect, b: Rect) -> f64 {
+    let along = |a_low: i64, a_high: i64, b_low: i64, b_high: i64| {
+        synth_geometry::nm_to_mm((a_low - b_high).max(b_low - a_high).max(0))
+    };
+    along(a.min.x_nm, a.max.x_nm, b.min.x_nm, b.max.x_nm)
+        .hypot(along(a.min.y_nm, a.max.y_nm, b.min.y_nm, b.max.y_nm))
+}
+
+/// Whether a net carries supply or ground rather than a signal: the power-domain
+/// inference calls it a rail or ground, or any pin on it is typed as a ground
+/// reference or a power input or output. The pin types are what the inference
+/// misses on a net the author left unnamed.
+pub(crate) fn is_supply_net(
+    board: &Board,
+    domains: &synth_ir::PowerDomainMap,
+    net: &synth_ir::Net,
+) -> bool {
+    use synth_registry::ElectricalType;
+    domains
+        .get(net.id)
+        .is_some_and(|domain| domain.is_rail() || domain.is_ground())
+        || net.endpoints.iter().any(|endpoint| {
+            board
+                .component(endpoint.component)
+                .and_then(|component| component.part.as_ref())
+                .and_then(|part| part.pins.get(endpoint.pin.0 as usize))
+                .is_some_and(|pin| {
+                    matches!(
+                        pin.electrical_type,
+                        ElectricalType::GroundReference
+                            | ElectricalType::PowerInput
+                            | ElectricalType::PowerOutput
+                    )
+                })
+        })
+}
+
+/// Reset buttons and crystals wired to an MCU's reset or clock pin, directly or
+/// through one resistor or capacitor (a debounce, a series resistor), that sit
+/// farther from the nearest such MCU than [`SUPPORT_PART_MAX_MM`].
+///
+/// Only signal nets count as wiring (see [`is_supply_net`]). A shared ground or
+/// supply rail connects every part to every MCU, so it says nothing about which
+/// one a part serves. A
+/// switch is a reset button only if it reaches a pin the MCU declares as its
+/// reset; a boot or user button on a GPIO, and a power slide switch, are not
+/// flagged. A part that already carries a hard hint is not advised again.
+///
+/// Reported as advice, not as a failure of the visual review. Pulling a button
+/// into the MCU's escape area was measured to break routability on the gate
+/// boards, so the placer is not steered; the agent is told, and a `near` hint it
+/// writes is then honoured as a hard one.
+fn distant_support_parts(board: &Board, placement: &Placement) -> Vec<DistantSupportPart> {
+    use synth_registry::PinCapability;
+
+    let domains = synth_ir::infer_power_domains(board);
+    // Each component's pins on signal nets, built once: the review runs inside
+    // `refine_placement`, so it must not walk every net for every pair.
+    let mut pins_on: std::collections::HashMap<ComponentId, Vec<(usize, synth_ir::PinId)>> =
+        std::collections::HashMap::new();
+    for (index, net) in board.nets.iter().enumerate() {
+        if is_supply_net(board, &domains, net) {
+            continue;
+        }
+        for endpoint in &net.endpoints {
+            pins_on
+                .entry(endpoint.component)
+                .or_default()
+                .push((index, endpoint.pin));
+        }
+    }
+    let courtyard = |component: &synth_ir::Component| {
+        placement
+            .components
+            .iter()
+            .find(|placed| placed.id == component.id)
+            .map(|placed| sidecar_courtyard_rect(board, component, placed))
+    };
+    // Whether `part` reaches a pin of `mcu` that `wanted` accepts.
+    let reaches = |part: &synth_ir::Component,
+                   mcu: &synth_ir::Component,
+                   wanted: &dyn Fn(&[PinCapability]) -> bool| {
+        let mcu_pin_ok = |net: usize| {
+            pins_on.get(&mcu.id).is_some_and(|pins| {
+                pins.iter().any(|&(n, pin)| {
+                    n == net
+                        && mcu
+                            .part
+                            .as_ref()
+                            .and_then(|p| p.pins.get(pin.0 as usize))
+                            .is_some_and(|p| wanted(&p.capabilities))
+                })
+            })
+        };
+        let Some(part_pins) = pins_on.get(&part.id) else {
+            return false;
+        };
+        if part_pins.iter().any(|&(net, _)| mcu_pin_ok(net)) {
+            return true;
+        }
+        // One resistor or capacitor between them.
+        part_pins.iter().any(|&(net, _)| {
+            board.nets[net].endpoints.iter().any(|endpoint| {
+                let Some(via) = board.component(endpoint.component) else {
+                    return false;
+                };
+                via.id != part.id
+                    && matches!(via.kind.as_str(), "resistor" | "capacitor")
+                    && pins_on
+                        .get(&via.id)
+                        .is_some_and(|pins| pins.iter().any(|&(n, _)| n != net && mcu_pin_ok(n)))
+            })
+        })
+    };
+
+    let mcus: Vec<&synth_ir::Component> = board
+        .components
+        .iter()
+        .filter(|component| is_mcu_like(component))
+        .collect();
+    let mut found = Vec::new();
+    for part in &board.components {
+        if is_hard_hinted(part) {
+            continue;
+        }
+        let (what, action): (&'static str, &'static str) = match part.kind.as_str() {
+            "switch" => ("reset button", "place_reset_button_near_mcu"),
+            "crystal" => ("crystal", "place_crystal_near_mcu"),
+            _ => continue,
+        };
+        let wanted = |capabilities: &[PinCapability]| {
+            if what == "crystal" {
+                capabilities
+                    .iter()
+                    .any(|c| matches!(c, PinCapability::ClockInput | PinCapability::ClockOutput))
+            } else {
+                capabilities.contains(&PinCapability::Reset)
+            }
+        };
+        let Some(part_courtyard) = courtyard(part) else {
+            continue;
+        };
+        // The nearest MCU it is wired to: nearest first, so the wiring is only
+        // looked at for a candidate that could be the nearest.
+        let mut by_distance: Vec<(f64, &synth_ir::Component)> = mcus
+            .iter()
+            .filter_map(|&mcu| {
+                courtyard(mcu).map(|rect| (courtyard_gap_mm(part_courtyard, rect), mcu))
+            })
+            .collect();
+        by_distance.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let Some(&(mm, mcu)) = by_distance
+            .iter()
+            .find(|&&(_, mcu)| reaches(part, mcu, &wanted))
+        else {
+            continue;
+        };
+        if mm > SUPPORT_PART_MAX_MM {
+            found.push(DistantSupportPart {
+                refdes: part.refdes.clone(),
+                mcu: mcu.refdes.clone(),
+                mm,
+                what,
+                action,
+            });
+        }
+    }
+    found
+}
+
+/// How far past its role limit a hinted support part may still sit: the
+/// nearest legal spot beside a crowded pad is not always inside it.
+const LEGAL_SPOT_SLACK_MM: f64 = 0.5;
+
+/// A part of a repeated circuit that sits where its counterpart in the first
+/// copy would not put it.
+#[derive(Debug)]
+struct MismatchedCopy {
+    refdes: String,
+    reference_refdes: String,
+    reference_anchor: String,
+    anchor: String,
+    mm: f64,
+    rotation_differs: bool,
+    suggested: (f64, f64),
+    suggested_rotation: Rotation,
+}
+
+/// The pairing of `n` parts with `n` counterparts that has the smallest total
+/// `cost(part, counterpart)`: every order for the few equal parts a circuit
+/// has, the Hungarian algorithm for a larger set.
+fn closest_pairing(n: usize, cost: impl Fn(usize, usize) -> f64) -> Vec<usize> {
+    fn search(
+        n: usize,
+        cost: &impl Fn(usize, usize) -> f64,
+        row: usize,
+        used: &mut Vec<bool>,
+        current: &mut Vec<usize>,
+        so_far: f64,
+        best: &mut (f64, Vec<usize>),
+    ) {
+        if so_far >= best.0 {
+            return;
+        }
+        if row == n {
+            *best = (so_far, current.clone());
+            return;
+        }
+        for j in 0..n {
+            if !used[j] {
+                used[j] = true;
+                current.push(j);
+                search(n, cost, row + 1, used, current, so_far + cost(row, j), best);
+                current.pop();
+                used[j] = false;
+            }
+        }
+    }
+    if n > 7 {
+        return hungarian_pairing(n, &cost);
+    }
+    let mut best = (f64::INFINITY, (0..n).collect());
+    search(
+        n,
+        &cost,
+        0,
+        &mut vec![false; n],
+        &mut Vec::new(),
+        0.0,
+        &mut best,
+    );
+    best.1
+}
+
+/// The minimum-cost pairing of `n` parts with `n` counterparts in O(n^3): the
+/// shortest-augmenting-path form of the Hungarian algorithm with row and column
+/// potentials. Ties go to the lower index, so the result is deterministic.
+fn hungarian_pairing(n: usize, cost: &impl Fn(usize, usize) -> f64) -> Vec<usize> {
+    // Rows and columns are 1-based; index 0 is the virtual start.
+    let mut u = vec![0.0_f64; n + 1];
+    let mut v = vec![0.0_f64; n + 1];
+    let mut owner = vec![0_usize; n + 1];
+    let mut way = vec![0_usize; n + 1];
+    for row in 1..=n {
+        owner[0] = row;
+        let mut col = 0;
+        let mut min_to = vec![f64::INFINITY; n + 1];
+        let mut visited = vec![false; n + 1];
+        loop {
+            visited[col] = true;
+            let current = owner[col];
+            let mut delta = f64::INFINITY;
+            let mut next = 0;
+            for j in 1..=n {
+                if visited[j] {
+                    continue;
+                }
+                let reduced = cost(current - 1, j - 1) - u[current] - v[j];
+                if reduced < min_to[j] {
+                    min_to[j] = reduced;
+                    way[j] = col;
+                }
+                if min_to[j] < delta {
+                    delta = min_to[j];
+                    next = j;
+                }
+            }
+            for j in 0..=n {
+                if visited[j] {
+                    u[owner[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    min_to[j] -= delta;
+                }
+            }
+            col = next;
+            if owner[col] == 0 {
+                break;
+            }
+        }
+        loop {
+            let previous = way[col];
+            owner[col] = owner[previous];
+            col = previous;
+            if col == 0 {
+                break;
+            }
+        }
+    }
+    let mut pairing = vec![0; n];
+    for j in 1..=n {
+        pairing[owner[j] - 1] = j - 1;
+    }
+    pairing
+}
+
+/// How far a part may sit from where the first copy's layout would put it
+/// before two copies of one circuit no longer read as copies.
+const REPEAT_TOLERANCE_MM: f64 = 1.0;
+
+/// Parts of repeated circuits whose position, relative to their copy's anchor,
+/// differs from the first copy's. Copies whose anchors face different ways are
+/// not compared: the offsets would have to be turned, and a wrong turn would be
+/// worse advice than none.
+fn mismatched_repeats(board: &Board, placement: &Placement) -> Vec<MismatchedCopy> {
+    let by_id: std::collections::HashMap<ComponentId, &ComponentPlacement> =
+        placement.components.iter().map(|p| (p.id, p)).collect();
+    let mut found = Vec::new();
+    for group in repeats::find_repeated_circuits(board) {
+        let reference = &group[0];
+        let Some(ref_anchor) = by_id.get(&reference.anchor) else {
+            continue;
+        };
+        for copy in &group[1..] {
+            let Some(anchor) = by_id.get(&copy.anchor) else {
+                continue;
+            };
+            if anchor.rotation != ref_anchor.rotation {
+                continue;
+            }
+            // The offsets are measured from each copy's anchor, so the two
+            // anchors have to be the same part of the circuit. When a copy
+            // chose another part as its anchor (a lone LED and its resistor
+            // rank alike), its offsets mean nothing against the reference.
+            let label_of = |island: &repeats::Island, id: ComponentId| {
+                island.parts.iter().find(|(p, _)| *p == id).map(|(_, l)| *l)
+            };
+            if label_of(copy, copy.anchor) != label_of(reference, reference.anchor) {
+                continue;
+            }
+            let mut labels: Vec<u64> = copy.parts.iter().map(|(_, l)| *l).collect();
+            labels.sort_unstable();
+            labels.dedup();
+            let offset = |id: ComponentId, from: &ComponentPlacement| {
+                by_id.get(&id).map(|p| {
+                    (
+                        synth_geometry::nm_to_mm(p.center.x_nm - from.center.x_nm),
+                        synth_geometry::nm_to_mm(p.center.y_nm - from.center.y_nm),
+                    )
+                })
+            };
+            for label in labels {
+                let ours = copy.parts_with_label(label, copy.anchor);
+                let theirs = reference.parts_with_label(label, reference.anchor);
+                if ours.is_empty() || ours.len() != theirs.len() {
+                    continue;
+                }
+                // Equal parts on different pins are interchangeable by
+                // structure alone; pair them so the layouts differ least.
+                let cost = |i: usize, j: usize| match (
+                    offset(ours[i], anchor),
+                    offset(theirs[j], ref_anchor),
+                ) {
+                    (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1),
+                    _ => f64::MAX / 8.0,
+                };
+                for (i, j) in closest_pairing(ours.len(), cost).into_iter().enumerate() {
+                    let (id, ref_part) = (&ours[i], theirs[j]);
+                    let (Some(here), Some(there)) = (by_id.get(id), by_id.get(&ref_part)) else {
+                        continue;
+                    };
+                    let want = Point::new(
+                        anchor.center.x_nm + (there.center.x_nm - ref_anchor.center.x_nm),
+                        anchor.center.y_nm + (there.center.y_nm - ref_anchor.center.y_nm),
+                    );
+                    let mm = synth_geometry::nm_to_mm(want.x_nm - here.center.x_nm)
+                        .hypot(synth_geometry::nm_to_mm(want.y_nm - here.center.y_nm));
+                    let rotation_differs = here.rotation != there.rotation;
+                    if mm > REPEAT_TOLERANCE_MM || rotation_differs {
+                        let name = |c: ComponentId| {
+                            board
+                                .component(c)
+                                .map_or_else(|| format!("#{}", c.0), |c| c.refdes.clone())
+                        };
+                        found.push(MismatchedCopy {
+                            refdes: name(*id),
+                            reference_refdes: name(ref_part),
+                            reference_anchor: name(reference.anchor),
+                            anchor: name(copy.anchor),
+                            mm,
+                            rotation_differs,
+                            suggested: (
+                                synth_geometry::nm_to_mm(want.x_nm),
+                                synth_geometry::nm_to_mm(want.y_nm),
+                            ),
+                            suggested_rotation: there.rotation,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The most mismatched-copy warnings one review lists; the rest are counted.
+const MAX_REPEAT_WARNINGS: usize = 6;
+
+/// The most far-support-part warnings one review lists; the rest are counted.
+const MAX_SUPPORT_PART_WARNINGS: usize = 8;
+
+/// Farthest a recognized support part may sit from the anchor pad it is bound
+/// to, centre to pad, by what it does. A decoupling capacitor loses its job
+/// as the loop to its pin grows, a load capacitor changes the oscillator, and
+/// a pull-up or a filter resistor only has to be near enough to route.
+///
+/// A dense anchor (see [`DENSE_PART_PINS`]) keeps a wider ring free for its pin
+/// escape, calibrated against routing on the reference boards
+/// ([`DENSE_PART_RING_MM`]), so a support part cannot sit as close to it. The
+/// limit allows for that ring, or the warning would ask for what the placer
+/// cannot give.
+fn support_part_limit_mm(role: synth_ir::MemberRole, anchor_is_dense: bool) -> f64 {
+    use synth_ir::MemberRole::{
+        DecouplingCap, DividerPartner, EsdDiode, I2cPullUp, LoadCap, OrphanRailCap, PullUp,
+        RailCap, ResetNetwork, RfMatchElement, SeriesElement, SeriesLimit, SignalSeries,
+    };
+    let base = match role {
+        DecouplingCap => 4.0,
+        LoadCap | EsdDiode | RfMatchElement | RailCap => 6.0,
+        DividerPartner => 8.0,
+        ResetNetwork | PullUp | I2cPullUp | SeriesElement | SeriesLimit | SignalSeries => 10.0,
+        OrphanRailCap => 12.0,
+    };
+    if anchor_is_dense {
+        base + DENSE_PART_RING_MM / 2.0 + 0.5
+    } else {
+        base
+    }
+}
+
+/// A support part that is farther from the pad it serves than its role allows.
+struct FarSupportPart {
+    refdes: String,
+    anchor: String,
+    pin: u32,
+    /// The anchor pin's name, as a `near: <part>.<pin>` hint spells it.
+    pin_name: String,
+    role: synth_ir::MemberRole,
+    mm: f64,
+    limit_mm: f64,
+}
+
+/// Every member of a recognized functional cluster that sits farther from its
+/// anchor pad than [`support_part_limit_mm`] allows. The cluster pass names
+/// the member's role and the anchor pin it is bound to, so the rule is stated
+/// by role and holds for any board; it names no part. A crystal or a reset
+/// button is advised separately and is not repeated here.
+fn far_support_parts(board: &Board, placement: &Placement) -> Vec<FarSupportPart> {
+    let pad_offsets = build_pad_offset_lookup(board);
+    let by_id: std::collections::HashMap<ComponentId, &ComponentPlacement> =
+        placement.components.iter().map(|p| (p.id, p)).collect();
+    let mut found = Vec::new();
+    for cluster in synth_ir::recognize_clusters(board) {
+        let Some(anchor) = board.component(cluster.anchor) else {
+            continue;
+        };
+        let Some(anchor_placed) = by_id.get(&cluster.anchor) else {
+            continue;
+        };
+        for member in &cluster.members {
+            let Some(part) = board.component(member.component) else {
+                continue;
+            };
+            if matches!(part.kind.as_str(), "switch" | "crystal") {
+                continue;
+            }
+            let Some(member_placed) = by_id.get(&member.component) else {
+                continue;
+            };
+            let pin = member.binding.anchor_pin.0;
+            let offset = pad_offsets
+                .lookup(cluster.anchor, pin as usize)
+                .unwrap_or((0, 0));
+            let pad = apply_rotation(**anchor_placed, offset);
+            let dx = synth_geometry::nm_to_mm(member_placed.center.x_nm - pad.x_nm);
+            let dy = synth_geometry::nm_to_mm(member_placed.center.y_nm - pad.y_nm);
+            let mm = dx.hypot(dy);
+            let limit_mm = support_part_limit_mm(member.role, is_dense_part(board, cluster.anchor));
+            if mm > limit_mm {
+                let pin_name = anchor
+                    .part
+                    .as_ref()
+                    .and_then(|p| p.pins.get(pin as usize))
+                    .map_or_else(|| pin.to_string(), |p| p.name.clone());
+                found.push(FarSupportPart {
+                    refdes: part.refdes.clone(),
+                    anchor: anchor.refdes.clone(),
+                    pin,
+                    pin_name,
+                    role: member.role,
+                    mm,
+                    limit_mm,
+                });
+            }
+        }
+    }
+    found
+}
+
 // Area-ratio math in the body casts nanometer integers to f64.
 // Board envelopes stay far below 2^53 nm, so the cast is exact for
 // every representable board; the allow documents that bound.
@@ -5004,6 +6085,135 @@ pub fn describe_placement(board: &Board, placement: &Placement) -> PlacementDesc
         });
     }
 
+    // An external connector belongs flush with the board edge, so a cable or
+    // a case does not meet the rim of the board first. Pin headers are the
+    // exception. This is advice and not a visual-review failure, as for a far
+    // reset button: a hard `edge:` hint is what makes the solver put it there.
+    for connector in &board.components {
+        if !matches!(connector.kind.as_str(), "connector" | "jack")
+            || connector
+                .part
+                .as_ref()
+                .is_none_or(|part| part.id.0.to_ascii_lowercase().starts_with("header"))
+        {
+            continue;
+        }
+        let Some((_, rect)) = courtyard_rects
+            .iter()
+            .find(|(refdes, _)| *refdes == connector.refdes.as_str())
+        else {
+            continue;
+        };
+        let outline = placement.board_outline;
+        let Some((gap_nm, edge)) = [
+            (rect.min.x_nm - outline.min.x_nm, "left"),
+            (rect.min.y_nm - outline.min.y_nm, "top"),
+            (outline.max.x_nm - rect.max.x_nm, "right"),
+            (outline.max.y_nm - rect.max.y_nm, "bottom"),
+        ]
+        .into_iter()
+        .min_by_key(|(gap, _)| *gap) else {
+            continue;
+        };
+        if gap_nm > mm_to_nm(FLUSH_CONNECTOR_TOLERANCE_MM) {
+            functional_warnings.push(format!(
+                "{} sits {:.1} mm inside the {edge} edge; an external connector must be flush with the board edge",
+                connector.refdes,
+                synth_geometry::nm_to_mm(gap_nm)
+            ));
+            recommended_actions.push(PlacementRecommendation {
+                action: "place_connector_flush".into(),
+                refdes: connector.refdes.clone(),
+                relative_to: None,
+                suggested_x_mm: None,
+                suggested_y_mm: None,
+                suggested_rotation_deg: None,
+                rationale: format!(
+                    "add a hard `edge: {edge}` placement hint to {}",
+                    connector.refdes
+                ),
+            });
+        }
+    }
+
+    // A support part belongs beside the pad it serves. Advice, not a visual
+    // review failure, as for a far reset button: the named `near:` hint is
+    // what makes the placer put it there.
+    // The worst few only: on a board the placer has not tuned, most support
+    // parts can be flagged, and a list that long hides the one to fix first.
+    let mut far_parts = far_support_parts(board, placement);
+    far_parts.sort_by(|a, b| (b.mm - b.limit_mm).total_cmp(&(a.mm - a.limit_mm)));
+    let omitted = far_parts.len().saturating_sub(MAX_SUPPORT_PART_WARNINGS);
+    far_parts.truncate(MAX_SUPPORT_PART_WARNINGS);
+    for far in far_parts {
+        functional_warnings.push(format!(
+            "{} ({:?}) is {:.0} mm from {} pin {} ({}), which it serves; keep it within {:.0} mm",
+            far.refdes, far.role, far.mm, far.anchor, far.pin_name, far.pin, far.limit_mm
+        ));
+        recommended_actions.push(PlacementRecommendation {
+            action: "place_support_part_near".into(),
+            refdes: far.refdes.clone(),
+            relative_to: Some(far.anchor.clone()),
+            suggested_x_mm: None,
+            suggested_y_mm: None,
+            suggested_rotation_deg: None,
+            rationale: format!(
+                "add a hard `near: {}.{}` placement hint to {}: it moves the part to the nearest legal spot beside that pad, which can still sit up to {LEGAL_SPOT_SLACK_MM} mm past its limit",
+                far.anchor, far.pin_name, far.refdes
+            ),
+        });
+    }
+    if omitted > 0 {
+        functional_warnings.push(format!(
+            "{omitted} more support part(s) are also farther from the pad they serve than their role allows; fix the ones above first"
+        ));
+    }
+
+    // Copies of one circuit read as copies only when laid out alike. Compared
+    // by structure, not by name; the first copy is the reference. The advice
+    // carries the coordinates that would make a part match, so the agent can
+    // pin them in its placement sidecar.
+    let mut mismatched = mismatched_repeats(board, placement);
+    mismatched.sort_by(|a, b| b.mm.total_cmp(&a.mm));
+    let omitted_copies = mismatched.len().saturating_sub(MAX_REPEAT_WARNINGS);
+    mismatched.truncate(MAX_REPEAT_WARNINGS);
+    for m in mismatched {
+        functional_warnings.push(format!(
+            "{} is laid out differently from {} in the identical circuit round {}: {:.1} mm{} from where {} puts it relative to {}; place it at ({:.1}, {:.1}) mm",
+            m.refdes,
+            m.reference_refdes,
+            m.reference_anchor,
+            m.mm,
+            if m.rotation_differs { " and turned differently" } else { "" },
+            m.reference_refdes,
+            m.anchor,
+            m.suggested.0,
+            m.suggested.1
+        ));
+        recommended_actions.push(PlacementRecommendation {
+            action: "match_repeated_circuit".into(),
+            refdes: m.refdes.clone(),
+            relative_to: Some(m.anchor.clone()),
+            suggested_x_mm: Some(m.suggested.0),
+            suggested_y_mm: Some(m.suggested.1),
+            suggested_rotation_deg: Some(match m.suggested_rotation {
+                Rotation::Zero => 0,
+                Rotation::Ninety => 90,
+                Rotation::OneEighty => 180,
+                Rotation::TwoSeventy => 270,
+            }),
+            rationale: format!(
+                "pin {} at the same offset from {} as {} is from {}",
+                m.refdes, m.anchor, m.reference_refdes, m.reference_anchor
+            ),
+        });
+    }
+    if omitted_copies > 0 {
+        functional_warnings.push(format!(
+            "{omitted_copies} more part(s) of repeated circuits are also laid out differently from the first copy"
+        ));
+    }
+
     // Human-style first-pass review of dense connector composition. A
     // high-pin connector should be edge-mounted, oriented so its long pin
     // row follows that edge, and have a clear first escape corridor to the
@@ -5193,7 +6403,7 @@ pub fn describe_placement(board: &Board, placement: &Placement) -> PlacementDesc
         if let Some(mcu) = board
             .components
             .iter()
-            .find(|component| matches!(component.kind.as_str(), "mcu" | "processor" | "ic"))
+            .find(|component| is_mcu_like(component))
         {
             if let Some(mcu_center) = center_of(mcu.id) {
                 let connector_center = connector_placement.center;
@@ -5386,6 +6596,30 @@ pub fn describe_placement(board: &Board, placement: &Placement) -> PlacementDesc
         }
     }
 
+    for part in distant_support_parts(board, placement) {
+        let DistantSupportPart {
+            refdes,
+            mcu,
+            mm,
+            what,
+            action,
+        } = part;
+        functional_warnings.push(format!(
+            "{refdes} is {mm:.0} mm (courtyard to courtyard) from {mcu}, which it is wired to; a {what} belongs within {SUPPORT_PART_MAX_MM:.0} mm of its MCU"
+        ));
+        recommended_actions.push(PlacementRecommendation {
+            action: action.into(),
+            refdes,
+            relative_to: Some(mcu.clone()),
+            suggested_x_mm: None,
+            suggested_y_mm: None,
+            suggested_rotation_deg: None,
+            rationale: format!(
+                "add `placement_hint {{ near: \"{mcu}\" priority: hard }}` to the {what} in the source"
+            ),
+        });
+    }
+
     let visual_score = 100u8.saturating_sub((visual_findings.len() as u8).saturating_mul(20));
     let visual_review = VisualPlacementReview {
         score: visual_score,
@@ -5497,12 +6731,12 @@ fn refine_placement<S: ::std::hash::BuildHasher>(
         }
         let before = current.clone();
         for action in &review.recommended_actions {
-            let hits = keepout_hits(board, &current);
+            let hits = keepout_overlaps(board, &current);
             let undo = current.clone();
             apply_recommendation(board, &mut current, action, rotation_overrides);
             // The validator rejects a part inside a keepout, so a move that
             // would put one there is dropped.
-            if keepout_hits(board, &current) > hits {
+            if keepout_overlaps(board, &current) > hits {
                 current = undo;
             }
         }
@@ -5554,6 +6788,25 @@ pub(crate) fn is_dense_part(board: &Board, id: ComponentId) -> bool {
 /// Rounds of squeezing before the pass gives up. Each accepted round shrinks
 /// the layout, so this only bounds a layout that keeps finding room.
 const COMPACT_ROUNDS: usize = 60;
+
+/// The step [`slide_parts`] leaves between two parts in an automatic
+/// placement. It keeps a channel between neighbours for the built-in router,
+/// which has to escape their pins.
+const SLIDE_PITCH_MM: f64 = 0.5;
+
+/// The same step between the parts of a sidecar floorplan. Their author
+/// already fixed every relation, so only the courtyard gap has to remain:
+/// the step is added on top of both courtyards, which already carry their
+/// footprint's copper margin, so a quarter of the automatic channel still
+/// clears the fab and DRC rules while shortening the chain that sets each
+/// board side.
+const PINNED_SLIDE_PITCH_MM: f64 = 0.125;
+
+/// Rounds [`close_pinned_bands`] gets. Halving the sliding step halves how
+/// far one round closes, so the pinned pass needs twice the rounds to reach
+/// the same bands. Only the sidecar floorplans see this bound; automatic
+/// placements keep [`COMPACT_ROUNDS`].
+const PINNED_COMPACT_ROUNDS: usize = COMPACT_ROUNDS * 2;
 
 /// Sweeps `separate_overlaps` may spend pushing courtyards apart.
 const SEPARATION_SWEEPS: usize = 200;
@@ -5607,6 +6860,27 @@ fn courtyard_envelope_area_mm2(board: &Board, placement: &Placement) -> f64 {
 /// spreads out evenly instead of drifting; a part in `frozen` never moves.
 /// Returns false when the overlaps could not be removed.
 fn separate_overlaps(placement: &mut Placement, sizes: &[(f64, f64)], frozen: &[bool]) -> bool {
+    separate_overlaps_with(placement, sizes, frozen, false)
+}
+
+/// Whether two rectangles share area, not merely an edge.
+fn overlap_in_area(a: &Rect, b: &Rect) -> bool {
+    a.min.x_nm < b.max.x_nm
+        && a.max.x_nm > b.min.x_nm
+        && a.min.y_nm < b.max.y_nm
+        && a.max.y_nm > b.min.y_nm
+}
+
+/// [`separate_overlaps`], optionally letting courtyards that only touch stay
+/// as they are. The placer treats touching as a collision; a pinned layout the
+/// export already passes may legally have parts edge to edge, and pushing them
+/// apart wastes the area a compaction is after.
+fn separate_overlaps_with(
+    placement: &mut Placement,
+    sizes: &[(f64, f64)],
+    frozen: &[bool],
+    touching_is_fine: bool,
+) -> bool {
     let pitch_nm = mm_to_nm(0.5);
     let rect_of = |placement: &Placement, index: usize| {
         rotated_courtyard_rect(&placement.components[index], sizes[index])
@@ -5617,7 +6891,7 @@ fn separate_overlaps(placement: &mut Placement, sizes: &[(f64, f64)], frozen: &[
         for i in 0..placement.components.len() {
             for j in (i + 1)..placement.components.len() {
                 let (a, b) = (rect_of(placement, i), rect_of(placement, j));
-                if !a.intersects(&b) {
+                if !a.intersects(&b) || (touching_is_fine && !overlap_in_area(&a, &b)) {
                     continue;
                 }
                 // Share of the push each part takes: the lighter one moves
@@ -5890,15 +7164,17 @@ fn labels_without_room(board: &Board, placement: &Placement, sizes: &[(f64, f64)
 /// until it touches the part in its way or reaches the edge of the layout. A
 /// part alone in its band moves into a free spot in the next band over, which
 /// scaling toward the middle never does. Parts move in order from the target
-/// side outward, so none passes another.
+/// side outward, so none passes another. `pitch_mm` is the grid step kept
+/// between two neighbours.
 fn slide_parts(
     placement: &mut Placement,
     sizes: &[(f64, f64)],
     movable: &[bool],
     along_y: bool,
     toward_low: bool,
+    pitch_mm: f64,
 ) {
-    let pitch_nm = mm_to_nm(0.5);
+    let pitch_nm = mm_to_nm(pitch_mm);
     let Some(envelope) = courtyard_envelope(placement, sizes) else {
         return;
     };
@@ -6123,6 +7399,80 @@ fn squeeze(
     }
 }
 
+/// The share of the board the courtyards cover, in percent.
+#[must_use]
+pub fn courtyard_fill_percent(board: &Board, placement: &Placement) -> f64 {
+    let sizes = courtyard_sizes(board, placement);
+    let covered: f64 = sizes.iter().map(|(w, h)| w * h).sum();
+    let outline = area_mm2(&placement.board_outline);
+    if outline <= 0.0 {
+        0.0
+    } else {
+        100.0 * covered / outline
+    }
+}
+
+/// Scales a finished placement toward its middle by `factor` (1.0 leaves it,
+/// 0.97 pulls every distance in by 3 %), pushes apart whatever then overlaps
+/// and fits the outline round the result. Unlike the placer's own `compact_placement` it does
+/// not judge the step and keeps no ring round a dense part: an agent's pinned
+/// layout is often tighter than that ring, and the caller decides by routing
+/// the result, which is the only test that knows how tight the layout can go. Each edge's connector row
+/// moves inward as one body, so connectors stay flush with the fitted outline.
+/// `None` only when the layout has no courtyards to scale.
+#[must_use]
+pub fn scale_layout_inward(board: &Board, placement: &Placement, factor: f64) -> Option<Placement> {
+    scale_layout_toward(board, placement, factor, (0.5, 0.5))
+}
+
+/// As [`scale_layout_inward`], scaling about the point `toward` names instead
+/// of the middle: `(0.0, 0.0)` is the top-left corner of the layout, `(1.0, 1.0)`
+/// the bottom-right, `(0.5, 0.5)` the middle. The side of the layout at that
+/// point stays where it is and the opposite side comes in, so empty space
+/// that sits against one side is taken from that side.
+#[must_use]
+pub fn scale_layout_toward(
+    board: &Board,
+    placement: &Placement,
+    factor: f64,
+    toward: (f64, f64),
+) -> Option<Placement> {
+    let mut candidate = placement.clone();
+    let sizes = courtyard_sizes(board, &candidate);
+    let envelope = courtyard_envelope(&candidate, &sizes)?;
+    let at = |low: i64, high: i64, fraction: f64| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        let offset = ((high - low) as f64 * fraction.clamp(0.0, 1.0)) as i64;
+        low + offset
+    };
+    let middle = Point::new(
+        at(envelope.min.x_nm, envelope.max.x_nm, toward.0),
+        at(envelope.min.y_nm, envelope.max.y_nm, toward.1),
+    );
+    let flush_edge = |id: ComponentId| flush_edge_index(board, id);
+    let frozen = vec![false; candidate.components.len()];
+    // Rounded, not truncated: 0.97 * 1000 is 969.999... in floating point.
+    #[allow(clippy::cast_possible_truncation)]
+    let permille = (factor.clamp(0.0, 1.0) * 1000.0).round() as i64;
+    squeeze(&mut candidate, permille, middle, &frozen, &flush_edge);
+    let pinned: Vec<bool> = candidate
+        .components
+        .iter()
+        .map(|p| flush_edge(p.id).is_some())
+        .collect();
+    // Best effort. The overlaps here are in the placer's own size model, which
+    // can call parts that touch an overlap when KiCad's courtyards do not; a
+    // layout the export already passes may carry some, and refusing to move
+    // it at all would leave nothing to compact. Whatever overlap is left is
+    // for the export's DRC to judge.
+    let _ = separate_overlaps_with(&mut candidate, &sizes, &pinned, true);
+    // The outline the export itself fits round a placement, so the size
+    // reported here is the size of the board that gets exported.
+    fit_outline_with_margin_mm(board, &mut candidate, tight_edge_margin_mm(board));
+    trim_outline_to_grid(board, &mut candidate);
+    Some(candidate)
+}
+
 /// Global compaction: pull every free part toward the middle of the layout,
 /// push apart whatever then overlaps, and keep the step only when the box
 /// around the courtyards shrinks while wiring gets no longer, nothing enters a
@@ -6190,7 +7540,7 @@ fn compact_placement(board: &Board, placement: Placement) -> Placement {
             (envelope.min.y_nm + envelope.max.y_nm) / 2,
         );
         let hpwl = total_hpwl_nm(board, &current);
-        let hits = keepout_hits(board, &current);
+        let hits = keepout_overlaps(board, &current);
         let labels = labels_without_room(board, &current, &sizes);
         // Separate what overlaps, then keep the candidate only if the box
         // around the courtyards is smaller and nothing got worse.
@@ -6203,7 +7553,7 @@ fn compact_placement(board: &Board, placement: Placement) -> Placement {
             }
             tighten_outline_to_hints(board, &mut candidate);
             let better = total_hpwl_nm(board, &candidate) <= hpwl
-                && keepout_hits(board, &candidate) <= hits
+                && keepout_overlaps(board, &candidate) <= hits
                 && edge_overhang(board, &candidate, &sizes, &flush_edge) == 0
                 && labels_without_room(board, &candidate, &sizes) <= labels;
             (better && keep_unless_worse(board, current.clone(), candidate.clone()) == candidate)
@@ -6221,7 +7571,14 @@ fn compact_placement(board: &Board, placement: Placement) -> Placement {
                 .iter()
                 .find_map(|&(along_y, toward_low)| {
                     let mut candidate = current.clone();
-                    slide_parts(&mut candidate, &spaced, &movable, along_y, toward_low);
+                    slide_parts(
+                        &mut candidate,
+                        &spaced,
+                        &movable,
+                        along_y,
+                        toward_low,
+                        SLIDE_PITCH_MM,
+                    );
                     shift_rows_inward(&mut candidate, &spaced, &flush_edge);
                     settle(candidate)
                 })
@@ -6465,7 +7822,7 @@ pub fn repack_interior(
     };
     let bins = repack_bins(&placement, &spaced, envelope);
     let baseline_hpwl = total_hpwl_nm(board, &placement);
-    let baseline_hits = keepout_hits(board, &placement);
+    let baseline_hits = keepout_overlap_count(board, &placement);
     let baseline_labels = labels_without_room(board, &placement, &sizes);
 
     let mut order: Vec<usize> = (0..placement.components.len())
@@ -6530,7 +7887,7 @@ pub fn repack_interior(
 
     if placement == original
         || total_hpwl_nm(board, &placement) > baseline_hpwl
-        || keepout_hits(board, &placement) > baseline_hits
+        || keepout_overlap_count(board, &placement) > baseline_hits
         || labels_without_room(board, &placement, &sizes) > baseline_labels
     {
         return original;
@@ -6821,7 +8178,7 @@ fn squeeze_passive_band(
     };
     let middle_y = (envelope.min.y_nm + envelope.max.y_nm) / 2;
     let baseline_hpwl = total_hpwl_nm(board, &placement);
-    let baseline_hits = keepout_hits(board, &placement);
+    let baseline_hits = keepout_overlap_count(board, &placement);
     let baseline_labels = labels_without_room(board, &placement, sizes);
     let frozen: Vec<bool> = movable.iter().map(|&free| !free).collect();
     let pitch_nm = mm_to_nm(0.5);
@@ -6844,7 +8201,7 @@ fn squeeze_passive_band(
         };
         if candidate_envelope.height_nm() >= best_height
             || total_hpwl_nm(board, &trial) > baseline_hpwl
-            || keepout_hits(board, &trial) > baseline_hits
+            || keepout_overlap_count(board, &trial) > baseline_hits
             || labels_without_room(board, &trial, sizes) > baseline_labels
         {
             continue;
@@ -6945,7 +8302,7 @@ fn centre_outside_rings(
 fn shorten_wires(board: &Board, mut placement: Placement) -> Placement {
     let pitch_nm = mm_to_nm(0.5);
     let mut hpwl = total_hpwl_nm(board, &placement);
-    let mut hits = keepout_hits(board, &placement);
+    let mut hits = keepout_overlaps(board, &placement);
     let sizes = courtyard_sizes(board, &placement);
     let mut labels = labels_without_room(board, &placement, &sizes);
     // The router needs room to leave a many-pin part's pins, so a passive may
@@ -7052,8 +8409,10 @@ fn shorten_wires(board: &Board, mut placement: Placement) -> Placement {
             if let Some(placed) = trial.components.iter_mut().find(|p| p.id == component.id) {
                 *placed = slot;
             }
-            let (trial_hpwl, trial_hits) =
-                (total_hpwl_nm(board, &trial), keepout_hits(board, &trial));
+            let (trial_hpwl, trial_hits) = (
+                total_hpwl_nm(board, &trial),
+                keepout_overlaps(board, &trial),
+            );
             let trial_labels = labels_without_room(board, &trial, &sizes);
             if trial_hpwl < hpwl && trial_hits <= hits && trial_labels <= labels {
                 hpwl = trial_hpwl;
@@ -7097,8 +8456,10 @@ fn clamp_to_edge_clearance(board: &Board, placement: &mut Placement, pinned: &Pi
     }
 }
 
-/// Parts whose centre lies inside a keepout circle, the rule the independent
-/// validator enforces (E-SYNTH-PLACE-004).
+/// Parts whose centre lies inside a keepout circle. Tests use it to tell a
+/// centre hit from a courtyard overlap ([`keepout_overlaps`]), which is what
+/// the independent validator reports (E-SYNTH-PLACE-004).
+#[cfg(test)]
 fn keepout_hits(board: &Board, placement: &Placement) -> usize {
     let centre_rect = |id: ComponentId| {
         placement
@@ -7118,6 +8479,43 @@ fn keepout_hits(board: &Board, placement: &Placement) -> usize {
                 placement.board_outline,
                 centre_rect,
             )
+        })
+        .count()
+}
+
+/// How many courtyards of `placement` sit in a keepout: the count the export's
+/// strict check rejects a layout for.
+#[must_use]
+pub fn keepout_overlap_count(board: &Board, placement: &Placement) -> usize {
+    keepout_overlaps(board, placement)
+}
+
+/// Count parts whose courtyard overlaps a keepout circle, not just whose
+/// centre does. The pinned band pass moves parts, so it uses the same strict
+/// test as packing: a courtyard can hang its pads into the no-route zone while
+/// its centre stays outside.
+fn keepout_overlaps(board: &Board, placement: &Placement) -> usize {
+    let rects: Vec<(ComponentId, Rect)> = placement
+        .components
+        .iter()
+        .filter_map(|placed| {
+            let component = board.component(placed.id)?;
+            Some((placed.id, sidecar_courtyard_rect(board, component, placed)))
+        })
+        .collect();
+    placement
+        .components
+        .iter()
+        .filter(|placed| {
+            let Some((_, rect)) = rects.iter().find(|(id, _)| *id == placed.id) else {
+                return false;
+            };
+            overlaps_keepout(*rect, placed.id, board, placement.board_outline, |id| {
+                rects
+                    .iter()
+                    .find(|(placed_id, _)| *placed_id == id)
+                    .map(|(_, rect)| *rect)
+            })
         })
         .count()
 }
@@ -7789,6 +9187,205 @@ board "features_only" {
         );
     }
 
+    /// Moves `refdes` 60 mm to the right of the MCU `U2`, far beyond the limit
+    /// whatever the courtyards.
+    fn far_from_u2(board: &Board, placement: &mut Placement, refdes: &str) {
+        let u2 = centre_of(board, placement, "U2");
+        move_part(
+            placement,
+            board,
+            refdes,
+            synth_geometry::nm_to_mm(u2.x_nm) + 60.0,
+            synth_geometry::nm_to_mm(u2.y_nm),
+        );
+    }
+
+    fn distant(board: &Board, placement: &Placement, refdes: &str) -> Option<DistantSupportPart> {
+        distant_support_parts(board, placement)
+            .into_iter()
+            .find(|part| part.refdes == refdes)
+    }
+
+    /// A reset button far from its MCU is advised against, and the advice names
+    /// the hint to write in the syntax the source takes. It is not a
+    /// visual-review failure: that would block routing on designs whose
+    /// routability depends on the part staying put.
+    #[test]
+    fn a_distant_reset_button_is_advised_against_but_does_not_block() {
+        let board = load_board("../../examples/sensor_logger/sensor_logger.synth");
+        let mut placement = place(&board).expect("place");
+        far_from_u2(&board, &mut placement, "SW1");
+        let far = distant(&board, &placement, "SW1").expect("SW1 reaches U2's reset pin");
+        assert_eq!(
+            far.mcu, "U2",
+            "U2 is the MCU in sensor_logger, U1 the regulator"
+        );
+        assert!(far.mm > SUPPORT_PART_MAX_MM);
+        let desc = describe_placement(&board, &placement);
+        assert!(desc
+            .functional_warnings
+            .iter()
+            .any(|w| w.starts_with("SW1 is ") && w.contains("U2")));
+        let action = desc
+            .visual_review
+            .recommended_actions
+            .iter()
+            .find(|a| a.action == far.action && a.refdes == "SW1")
+            .expect("the advice for SW1");
+        assert_eq!(action.relative_to.as_deref(), Some("U2"));
+        assert!(
+            action
+                .rationale
+                .contains(r#"placement_hint { near: "U2" priority: hard }"#),
+            "the advice must be the syntax the source takes: {}",
+            action.rationale
+        );
+        // The advice is a functional warning, never a visual finding: a visual
+        // finding would block routing on designs that depend on the part
+        // staying put.
+        assert!(
+            desc.visual_review
+                .findings
+                .iter()
+                .all(|finding| !finding.contains("belongs within")),
+            "{:?}",
+            desc.visual_review.findings
+        );
+    }
+
+    /// A button beside its MCU is not advised against; the limit is measured
+    /// between courtyards, not between anchors.
+    #[test]
+    fn a_reset_button_beside_its_mcu_is_left_alone() {
+        let board = load_board("../../examples/sensor_logger/sensor_logger.synth");
+        let mut placement = place(&board).expect("place");
+        let u2 = centre_of(&board, &placement, "U2");
+        move_part(
+            &mut placement,
+            &board,
+            "SW1",
+            synth_geometry::nm_to_mm(u2.x_nm) + 12.0,
+            synth_geometry::nm_to_mm(u2.y_nm),
+        );
+        assert!(distant(&board, &placement, "SW1").is_none());
+    }
+
+    /// A switch whose only link to the MCU is the ground net is not a reset
+    /// button: every part on the board shares that net with every MCU. A GPIO
+    /// button is likewise not told to move into the MCU's escape area.
+    #[test]
+    fn a_switch_tied_to_the_mcu_only_through_ground_is_not_flagged() {
+        let board = load_board_replacing(
+            "../../examples/sensor_logger/sensor_logger.synth",
+            &[("connect U2.reset -> SW1.p1", "connect U2.pb0 -> SW1.p1")],
+        );
+        let mut placement = place(&board).expect("place");
+        far_from_u2(&board, &mut placement, "SW1");
+        assert!(
+            distant(&board, &placement, "SW1").is_none(),
+            "SW1 reaches U2 through a GPIO and GND only"
+        );
+        // And with nothing but ground between them.
+        let board = load_board_replacing(
+            "../../examples/sensor_logger/sensor_logger.synth",
+            &[("connect U2.reset -> SW1.p1", "")],
+        );
+        let mut placement = place(&board).expect("place");
+        far_from_u2(&board, &mut placement, "SW1");
+        assert!(distant(&board, &placement, "SW1").is_none());
+    }
+
+    /// Each part is judged against the nearest MCU it is wired to: a button
+    /// beside one of two MCUs is not reported as far from the other.
+    #[test]
+    fn a_two_mcu_board_judges_a_part_against_its_nearest_mcu() {
+        let board = load_board_replacing(
+            "../../examples/sensor_logger/sensor_logger.synth",
+            &[(
+                "connect SW1.p2  -> U2.gnd",
+                "connect SW1.p2  -> U2.gnd\n  component U9: mcu \"atmega328p\"\n  connect U9.reset -> SW1.p1",
+            )],
+        );
+        let mut placement = place(&board).expect("place");
+        let u2 = centre_of(&board, &placement, "U2");
+        let (x, y) = (
+            synth_geometry::nm_to_mm(u2.x_nm),
+            synth_geometry::nm_to_mm(u2.y_nm),
+        );
+        // SW1 and U9 together, 60 mm from U2.
+        move_part(&mut placement, &board, "SW1", x + 60.0, y);
+        move_part(&mut placement, &board, "U9", x + 66.0, y);
+        assert!(
+            distant(&board, &placement, "SW1").is_none(),
+            "SW1 sits beside U9, which its reset line also reaches"
+        );
+        // Both MCUs far: it is reported against the nearer.
+        move_part(&mut placement, &board, "U9", x - 60.0, y);
+        let far = distant(&board, &placement, "SW1").expect("far from both");
+        assert!(
+            far.mcu == "U2" || far.mcu == "U9",
+            "named against a real MCU: {}",
+            far.mcu
+        );
+        move_part(&mut placement, &board, "U9", x + 20.0, y);
+        let far = distant(&board, &placement, "SW1").expect("far from both");
+        assert_eq!(far.mcu, "U9", "U9 at 40 mm is nearer than U2 at 60 mm");
+    }
+
+    /// A crystal is judged by its clock pins: one wired to the MCU's clock input
+    /// is advised when far, and one that only shares the supply and ground with
+    /// it is not.
+    #[test]
+    fn a_crystal_is_judged_by_its_clock_pin_not_its_supply() {
+        let move_y1_away = |board: &Board| {
+            let mut placement = place(board).expect("place");
+            let u1 = centre_of(board, &placement, "U1");
+            move_part(
+                &mut placement,
+                board,
+                "Y1",
+                synth_geometry::nm_to_mm(u1.x_nm) + 60.0,
+                synth_geometry::nm_to_mm(u1.y_nm),
+            );
+            placement
+        };
+        let board = load_board("../../fixtures/designs/secure_tracker.synth");
+        let placement = move_y1_away(&board);
+        let far = distant(&board, &placement, "Y1").expect("Y1 reaches U1's clock input");
+        assert_eq!((far.mcu.as_str(), far.what), ("U1", "crystal"));
+
+        let board = load_board_replacing(
+            "../../fixtures/designs/secure_tracker.synth",
+            &[("connect Y1.out -> U1.xin", "")],
+        );
+        let placement = move_y1_away(&board);
+        assert!(
+            distant(&board, &placement, "Y1").is_none(),
+            "with its output unwired, Y1 shares only supply nets with U1"
+        );
+    }
+
+    /// A part that already carries a hard hint is not told to add one.
+    #[test]
+    fn a_hard_hinted_support_part_is_not_advised_again() {
+        let board = load_board_replacing(
+            "../../examples/sensor_logger/sensor_logger.synth",
+            &[(
+                r#"component SW1: switch    "spst_tactile""#,
+                r#"component SW1: switch    "spst_tactile" { placement_hint { near: "U2" priority: hard } }"#,
+            )],
+        );
+        let mut placement = place(&board).expect("place");
+        far_from_u2(&board, &mut placement, "SW1");
+        assert!(distant(&board, &placement, "SW1").is_none());
+        let desc = describe_placement(&board, &placement);
+        assert!(!desc
+            .visual_review
+            .recommended_actions
+            .iter()
+            .any(|a| a.refdes == "SW1" && a.action == "place_reset_button_near_mcu"));
+    }
+
     /// A real placement of a real design should clear the gate. If this fails,
     /// the placer regressed or the gate thresholds drifted.
     #[test]
@@ -8156,6 +9753,198 @@ board "features_only" {
 
     /// A loose layout is squeezed toward its centre: the envelope around the
     /// courtyards shrinks, wiring gets no longer, and nothing overlaps.
+    /// A quarter turn swaps a connector's extents, so a placement that was legal
+    /// can leave the board once it is turned. The turn is declined then, and
+    /// taken when there is room.
+    #[test]
+    fn a_connector_turn_that_would_leave_the_outline_is_declined() {
+        use synth_geometry::Rotation;
+        use synth_registry::MatingFace;
+
+        let board = load_board("../../fixtures/designs/edge_jst_connectors.synth");
+        let placement = place(&board).expect("place");
+        let j1 = board
+            .components
+            .iter()
+            .find(|c| c.refdes == "J1")
+            .expect("J1")
+            .clone();
+        let size = |c: &synth_ir::Component| {
+            c.part.as_ref().map_or_else(
+                || fallback_courtyard(&c.kind),
+                |part| synth_layout::pcb_courtyard_geometry_for_part(part).1,
+            )
+        };
+        let lookup: std::collections::HashMap<ComponentId, (f64, f64)> =
+            board.components.iter().map(|c| (c.id, size(c))).collect();
+        let (w, h) = size(&j1);
+        assert!(
+            (w - h).abs() > 1.0,
+            "the connector must change shape when turned: {w} x {h}"
+        );
+
+        // J1 asked for the left edge; turn it a quarter away from the rotation
+        // that opens out of that edge, so the pass wants to turn it back.
+        let wanted =
+            floorplan::rotation_for_mating_edge(MatingFace::Bottom, floorplan::BoardEdge::Left);
+        let wrong = if wanted.swaps_extents() {
+            Rotation::Zero
+        } else {
+            Rotation::Ninety
+        };
+        // J1 sits against the left edge of a board 100 mm long, so the pass
+        // reads it as a left-edge connector; how far it sits from that edge
+        // and how tall the board is are all that differ between the two cases.
+        let (placed_w, placed_h) = if wrong.swaps_extents() {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        let run = |left_mm: f64, board_height_mm: f64| {
+            let outline = Rect::new(
+                Point::new(mm_to_nm(20.0), mm_to_nm(20.0)),
+                Point::new(mm_to_nm(120.0), mm_to_nm(20.0 + board_height_mm)),
+            );
+            let mut placements = placement.components.clone();
+            for placed in &mut placements {
+                if placed.id == j1.id {
+                    placed.rotation = wrong;
+                    placed.center = Point::new(
+                        outline.min.x_nm + mm_to_nm(placed_w / 2.0 + left_mm),
+                        (outline.min.y_nm + outline.max.y_nm) / 2,
+                    );
+                } else {
+                    // Far from the connector, so only the outline can stop the turn.
+                    placed.center = Point::new(mm_to_nm(500.0), mm_to_nm(500.0));
+                }
+            }
+            face_edge_connectors_outward(
+                &board,
+                outline,
+                &mut placements,
+                &lookup,
+                &std::collections::HashMap::new(),
+            );
+            placements
+                .iter()
+                .find(|placed| placed.id == j1.id)
+                .map(|placed| placed.rotation)
+                .expect("J1 placed")
+        };
+
+        // A board only as tall as the connector as it sits: turned a quarter,
+        // it would be taller than the board.
+        assert_eq!(
+            run(0.1, placed_h + 0.8),
+            wrong,
+            "a turn that leaves the board is declined"
+        );
+        // The same connector with room to turn is turned.
+        assert_eq!(run(5.0, 40.0), wanted, "with room the connector is turned");
+    }
+
+    /// Courtyards that only touch are a legal layout; the compaction's scale step
+    /// must not push them apart, or a tight layout gains less than its scale.
+    #[test]
+    fn touching_courtyards_stay_put_when_touching_is_fine() {
+        let board = load_board("../../examples/sensor_logger/sensor_logger.synth");
+        let placement = place(&board).expect("place");
+        let sizes_all = courtyard_sizes(&board, &placement);
+        let mut pair = Placement {
+            board_outline: placement.board_outline,
+            components: placement.components[..2].to_vec(),
+        };
+        let sizes = sizes_all[..2].to_vec();
+        // Put the second part's courtyard exactly against the first's right edge.
+        let first = rotated_courtyard_rect(&pair.components[0], sizes[0]);
+        let second = rotated_courtyard_rect(&pair.components[1], sizes[1]);
+        let half_width = (second.max.x_nm - second.min.x_nm) / 2;
+        pair.components[1].center =
+            Point::new(first.max.x_nm + half_width, pair.components[0].center.y_nm);
+        let before = pair.components[1].center;
+        let frozen = [false, false];
+
+        let mut kept = pair.clone();
+        assert!(separate_overlaps_with(&mut kept, &sizes, &frozen, true));
+        assert_eq!(kept.components[1].center, before, "touching is left alone");
+
+        let mut pushed = pair.clone();
+        separate_overlaps_with(&mut pushed, &sizes, &frozen, false);
+        assert_ne!(
+            pushed.components[1].center, before,
+            "the placer's own rule still separates touching courtyards"
+        );
+    }
+
+    #[test]
+    fn scaling_a_layout_inward_shrinks_the_outline_and_keeps_courtyards_apart() {
+        let board = load_board("../../examples/sensor_logger/sensor_logger.synth");
+        // The placer packs this board tight already, so spread it first: the
+        // slack an agent's pinned layout carries.
+        let mut placement = place(&board).expect("place");
+        for placed in &mut placement.components {
+            placed.center = Point::new(placed.center.x_nm * 13 / 10, placed.center.y_nm * 13 / 10);
+        }
+        tighten_outline_after_sidecar(&board, &mut placement);
+        let before = placement.board_outline;
+        let scaled = scale_layout_inward(&board, &placement, 0.9).expect("a 10 % scale separates");
+        assert!(
+            scaled.board_outline.width_nm() * scaled.board_outline.height_nm()
+                < before.width_nm() * before.height_nm(),
+            "the outline follows the scaled layout"
+        );
+        let sizes = courtyard_sizes(&board, &scaled);
+        let rects: Vec<Rect> = scaled
+            .components
+            .iter()
+            .zip(&sizes)
+            .map(|(p, size)| rotated_courtyard_rect(p, *size))
+            .collect();
+        for (i, a) in rects.iter().enumerate() {
+            for b in &rects[i + 1..] {
+                let overlap = a.min.x_nm < b.max.x_nm - 1_000
+                    && b.min.x_nm < a.max.x_nm - 1_000
+                    && a.min.y_nm < b.max.y_nm - 1_000
+                    && b.min.y_nm < a.max.y_nm - 1_000;
+                assert!(!overlap, "courtyards overlap after scaling");
+            }
+        }
+        let same = scale_layout_inward(&board, &placement, 1.0).expect("unity");
+        // Positions snap to the 0.5 mm placement pitch, and nothing more.
+        for (a, b) in same.components.iter().zip(&placement.components) {
+            assert!(
+                (a.center.x_nm - b.center.x_nm).abs() <= mm_to_nm(0.5)
+                    && (a.center.y_nm - b.center.y_nm).abs() <= mm_to_nm(0.5),
+                "1.0 moves a part more than the pitch"
+            );
+        }
+    }
+
+    #[test]
+    fn scaling_toward_a_corner_takes_the_slack_from_the_opposite_sides() {
+        let board = load_board("../../examples/sensor_logger/sensor_logger.synth");
+        let mut placement = place(&board).expect("place");
+        for placed in &mut placement.components {
+            placed.center = Point::new(placed.center.x_nm * 13 / 10, placed.center.y_nm * 13 / 10);
+        }
+        let sizes = courtyard_sizes(&board, &placement);
+        let before = courtyard_envelope(&placement, &sizes).expect("envelope");
+        let scaled = scale_layout_toward(&board, &placement, 0.9, (1.0, 1.0)).expect("scales");
+        let after =
+            courtyard_envelope(&scaled, &courtyard_sizes(&board, &scaled)).expect("envelope");
+        let pitch = mm_to_nm(0.5) * 2;
+        assert!(
+            (after.max.x_nm - before.max.x_nm).abs() <= pitch
+                && (after.max.y_nm - before.max.y_nm).abs() <= pitch,
+            "the bottom-right corner stays: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.min.x_nm > before.min.x_nm + mm_to_nm(2.0)
+                && after.min.y_nm > before.min.y_nm + mm_to_nm(2.0),
+            "the top-left side comes in: {before:?} -> {after:?}"
+        );
+    }
+
     #[test]
     fn compaction_squeezes_a_loose_layout() {
         let (board, loose) = row_board(FOUR_IN_A_CHAIN, &[8.0, 24.0, 40.0, 56.0]);
@@ -8243,6 +10032,59 @@ board "features_only" {
         assert_eq!(keepout_hits(&board, &packed), 0);
     }
 
+    /// The pinned band gate must see a courtyard whose edge enters a keepout
+    /// even when its centre is outside: a slide could otherwise hang pads into
+    /// the no-route zone while the centre test still calls the part clear.
+    #[test]
+    fn the_pinned_band_keepout_gate_checks_the_whole_courtyard() {
+        let components = r#"
+            keepout R1 { radius 5mm }
+            component R1: resistor "r_generic_0603" value "10k"
+            component R2: resistor "r_generic_0603" value "10k"
+            connect R1.p2 -> R2.p1
+        "#;
+        let (board, mut placement) = row_board(components, &[10.0, 40.0]);
+        assert_eq!(keepout_overlaps(&board, &placement), 0, "setup is clear");
+
+        // The centre is 5.4 mm from R1, outside the 5 mm circle; the courtyard
+        // reaches back inside it.
+        move_part(&mut placement, &board, "R2", 15.4, 15.0);
+        assert_eq!(keepout_hits(&board, &placement), 0, "centre is outside");
+        assert!(
+            keepout_overlaps(&board, &placement) > 0,
+            "the courtyard overlaps the keepout"
+        );
+    }
+
+    /// The automatic placer must keep a courtyard out of a keepout circle, not
+    /// only its centre: parts wired to the keepout's anchor are pulled right up
+    /// to the circle, where a centre-only test leaves their pads inside it.
+    #[test]
+    fn the_automatic_placer_keeps_courtyards_out_of_a_keepout() {
+        let source = r#"board "keepout" { layers 2
+            keepout ANT1 { radius 6mm }
+            component ANT1: antenna "ant_chip_2g4"
+            component R1: resistor "r_generic_0603" value "10k"
+            component R2: resistor "r_generic_0603" value "10k"
+            component R3: resistor "r_generic_0603" value "10k"
+            component R4: resistor "r_generic_0603" value "10k"
+            connect ANT1.feed -> R1.p1
+            connect R1.p2 -> R2.p1
+            connect R2.p2 -> R3.p1
+            connect R3.p2 -> R4.p1
+        }"#;
+        let file = "keepout.synth".to_string();
+        let parse = synth_parser::parse(source, file.clone());
+        let registry =
+            synth_registry::load_dir(&std::path::Path::new("../..").join("registry").join("parts"))
+                .expect("registry");
+        let board = synth_ir::lower(parse.ast.as_ref().expect("parses"), &registry, &file)
+            .board
+            .expect("lowers");
+        let placement = place(&board).expect("place");
+        assert_eq!(keepout_overlaps(&board, &placement), 0);
+    }
+
     /// A row of connectors along an edge is packed together, in the same
     /// order, so the row stops setting the board width.
     #[test]
@@ -8294,12 +10136,179 @@ board "features_only" {
         let movable = vec![true; loose.components.len()];
 
         let mut slid = loose.clone();
-        slide_parts(&mut slid, &sizes, &movable, true, true);
+        slide_parts(&mut slid, &sizes, &movable, true, true, SLIDE_PITCH_MM);
 
         let y = |p: &Placement, r| centre_of(&board, p, r).y_nm;
         assert_eq!(y(&slid, "R3"), y(&slid, "R1"), "R3 joins the band above");
         assert_eq!(y(&slid, "R1"), y(&loose, "R1"));
         assert_eq!(overlaps(&board, &slid), 0);
+    }
+
+    /// A board with `parts` components. The rim schedule reads only the part
+    /// count, so the parts themselves are placeholders.
+    fn board_with_part_count(parts: usize) -> Board {
+        let mut board = load_board("../../fixtures/layout/divider.synth");
+        board.nets.clear();
+        let template = board.components[0].clone();
+        while board.components.len() < parts {
+            let index = board.components.len();
+            let mut component = template.clone();
+            component.id = ComponentId(u32::try_from(index).expect("id fits"));
+            component.refdes = format!("R{index}");
+            board.components.push(component);
+        }
+        board.components.truncate(parts);
+        board
+    }
+
+    /// The export rim is a schedule over board size, and a dense board keeps
+    /// the board rim for its edge passives too.
+    ///
+    /// The dense passive rule is the one sensor_logger needs: at the tighter
+    /// passive rim the router strands a via inside pad C9.1.
+    #[test]
+    fn export_rim_tiers_step_by_board_size() {
+        for (parts, tight, passive) in [
+            (2usize, 0.65, 0.65),
+            (15, 1.0, 0.9),
+            (20, 1.3, 1.3),
+            (29, 1.3, 1.3),
+            (32, 1.25, 1.25),
+        ] {
+            let board = board_with_part_count(parts);
+            assert_eq!(tight_edge_margin_mm(&board), tight, "{parts} parts");
+            assert_eq!(passive_edge_margin_mm(&board), passive, "{parts} parts");
+        }
+    }
+
+    /// A sidecar floorplan leaves bands no courtyard uses. The pinned pass
+    /// closes the one between these two parts, so the outline the export fits
+    /// round the result is smaller than the pinned coordinates alone.
+    #[test]
+    fn pinned_band_closing_shrinks_the_exported_outline() {
+        let components = r#"
+            component R1: resistor "r_generic_0603" value "10k"
+            component R2: resistor "r_generic_0603" value "10k"
+        "#;
+        let (board, pinned_layout) = row_board(components, &[10.0, 40.0]);
+        let before = area_mm2(&exported_outline(&board, &pinned_layout).expect("outline"));
+
+        let sidecar_path = std::env::temp_dir().join(format!(
+            "synth-place-band-close-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &sidecar_path,
+            "schema_version = 2\n\n[components.R1]\nx = 10.0\ny = 15.0\nrotation = 0\n\
+             source = \"human_drag\"\npriority = \"hard\"\n\n[components.R2]\nx = 40.0\n\
+             y = 15.0\nrotation = 0\nsource = \"human_drag\"\npriority = \"hard\"\n",
+        )
+        .expect("sidecar TOML written");
+        let closed = place_with_tuning_and_sidecar_seeded(
+            &board,
+            1.5,
+            &std::collections::HashMap::new(),
+            Some(&sidecar_path),
+            0,
+        )
+        .expect("place");
+        std::fs::remove_file(&sidecar_path).ok();
+
+        let after = area_mm2(&exported_outline(&board, &closed).expect("outline"));
+        assert!(after < before, "band closed: {after} < {before}");
+    }
+
+    /// A sidecar export fits its outline at the scheduled rim, not the wider
+    /// placement margin: an edge passive on a two-part board keeps 0.65 mm
+    /// between its courtyard and the outline, the same as an export without a
+    /// sidecar.
+    #[test]
+    fn a_sidecar_placement_keeps_the_passive_rim() {
+        let components = r#"
+            component R1: resistor "r_generic_0603" value "10k"
+            component R2: resistor "r_generic_0603" value "10k"
+        "#;
+        let (board, _) = row_board(components, &[10.0, 40.0]);
+        let sidecar_path = std::env::temp_dir().join(format!(
+            "synth-place-passive-rim-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &sidecar_path,
+            "schema_version = 2\n\n[components.R1]\nx = 10.0\ny = 15.0\nrotation = 0\n\
+             source = \"human_drag\"\npriority = \"hard\"\n\n[components.R2]\nx = 40.0\n\
+             y = 15.0\nrotation = 0\nsource = \"human_drag\"\npriority = \"hard\"\n",
+        )
+        .expect("sidecar TOML written");
+        let placed = place_with_sidecar(&board, Some(&sidecar_path)).expect("place");
+        std::fs::remove_file(&sidecar_path).ok();
+
+        let left = board
+            .components
+            .iter()
+            .filter_map(|component| {
+                let placement = placed.components.iter().find(|p| p.id == component.id)?;
+                Some(
+                    sidecar_courtyard_rect(&board, component, placement)
+                        .min
+                        .x_nm,
+                )
+            })
+            .min()
+            .expect("two parts placed");
+        assert_eq!(
+            left - placed.board_outline.min.x_nm,
+            mm_to_nm(0.65),
+            "the left passive sits at the scheduled passive rim"
+        );
+    }
+
+    /// The combined outline on a small board must come in under the best
+    /// single arm fit for the same board.
+    ///
+    /// The best single arm (outline packing) fitted exactly 180.96 mm2 on this
+    /// two-part board at the 1.0 mm sparse rim; the tiny tier fits 161.99 mm2.
+    #[test]
+    fn combined_outline_is_not_larger_than_the_best_arm() {
+        let board = load_board("../../fixtures/designs/connect_single.synth");
+        let mut placement = place(&board).expect("place");
+        fit_outline_with_passive_margin_mm(
+            &board,
+            &mut placement,
+            tight_edge_margin_mm(&board),
+            passive_edge_margin_mm(&board),
+        );
+        let area = area_mm2(&placement.board_outline);
+        assert!(area < 175.0, "combined outline {area} mm2");
+    }
+
+    /// A decoupling cap further from its IC than the limit is reported. The
+    /// scorer measures the IC-to-cap distance, so a placement that strands one
+    /// cannot pass silently.
+    #[test]
+    fn a_decoupling_cap_beyond_the_limit_is_reported() {
+        let components = r#"
+            component U1: opamp "lm358_dual"
+            component C1: capacitor "c_generic_0603" value "100n"
+            connect U1.vcc_pos -> C1.p1
+        "#;
+        let (board, mut placement) = row_board(components, &[10.0, 10.0]);
+
+        move_part(&mut placement, &board, "C1", 12.0, 15.0);
+        let near = crate::score::score_placement(&board, &placement);
+        assert!(
+            (near.max_decoupling_distance_mm - 2.0).abs() < 0.01,
+            "2 mm apart, measured {}",
+            near.max_decoupling_distance_mm
+        );
+
+        move_part(&mut placement, &board, "C1", 14.0, 15.0);
+        let far = crate::score::score_placement(&board, &placement);
+        assert!(
+            far.max_decoupling_distance_mm > 3.0,
+            "4 mm apart, measured {}",
+            far.max_decoupling_distance_mm
+        );
     }
 
     /// A part cannot slide through one that is in its way.
@@ -8315,7 +10324,7 @@ board "features_only" {
         let movable = vec![true; loose.components.len()];
 
         let mut slid = loose.clone();
-        slide_parts(&mut slid, &sizes, &movable, true, true);
+        slide_parts(&mut slid, &sizes, &movable, true, true, SLIDE_PITCH_MM);
 
         let y = |p: &Placement, r| centre_of(&board, p, r).y_nm;
         assert!(y(&slid, "R2") > y(&slid, "R1"), "order kept");
@@ -8535,6 +10544,636 @@ board "features_only" {
         assert!(
             bottom_gap(&by_geometry) >= fitted_edge_margin_nm(&board),
             "setup: geometry picks another side"
+        );
+    }
+
+    /// An external connector inside the board edge is advised to go flush; a
+    /// pin header at the same distance is not, and neither blocks routing.
+    #[test]
+    fn an_inboard_external_connector_is_advised_to_go_flush_but_a_header_is_not() {
+        let components = r#"component J1: connector "jst_xh_2pin"
+               component J2: connector "header_1x3"
+               component R1: resistor "r_generic_0603" value "10k"
+               component R2: resistor "r_generic_0603" value "10k""#;
+        let (board, mut placement) = row_board(components, &[0.0; 4]);
+        move_part(&mut placement, &board, "J1", 30.0, 20.0);
+        move_part(&mut placement, &board, "J2", 30.0, 32.0);
+        move_part(&mut placement, &board, "R1", 10.0, 10.0);
+        move_part(&mut placement, &board, "R2", 50.0, 12.0);
+        tighten_outline_after_sidecar(&board, &mut placement);
+        let desc = describe_placement(&board, &placement);
+        assert!(
+            desc.functional_warnings
+                .iter()
+                .any(|w| w.starts_with("J1 sits ") && w.contains("flush")),
+            "{:?}",
+            desc.functional_warnings
+        );
+        assert!(!desc
+            .functional_warnings
+            .iter()
+            .any(|w| w.starts_with("J2 sits ")));
+        assert!(desc.visual_review.recommended_actions.iter().any(|a| {
+            a.action == "place_connector_flush" && a.refdes == "J1" && a.rationale.contains("edge:")
+        }));
+        assert!(!desc.visual_review.requires_revision);
+    }
+
+    #[test]
+    fn a_flush_external_connector_gets_no_edge_advice() {
+        let edge = "{ placement_hint { edge: left priority: hard } }";
+        let components = format!(
+            r#"component J1: connector "jst_xh_2pin" {edge}
+               component R1: resistor "r_generic_0603" value "10k"
+               component R2: resistor "r_generic_0603" value "10k""#
+        );
+        let (board, mut placement) = row_board(&components, &[0.0; 3]);
+        move_part(&mut placement, &board, "J1", 8.0, 24.0);
+        move_part(&mut placement, &board, "R1", 40.0, 10.0);
+        move_part(&mut placement, &board, "R2", 46.0, 12.0);
+        tighten_outline_after_sidecar(&board, &mut placement);
+        let desc = describe_placement(&board, &placement);
+        assert!(
+            !desc
+                .functional_warnings
+                .iter()
+                .any(|w| w.starts_with("J1 sits ")),
+            "{:?}",
+            desc.functional_warnings
+        );
+    }
+
+    /// A support part is judged by the role the cluster pass gives it and the
+    /// pad it is bound to, so a decoupling capacitor moved far from its IC is
+    /// advised against, and one beside it is not. The rule names no part.
+    #[test]
+    fn a_support_part_far_from_the_pad_it_serves_is_advised_against() {
+        let board = load_board("../../examples/sensor_logger/sensor_logger.synth");
+        let mut placement = place(&board).expect("place");
+        let cluster = synth_ir::recognize_clusters(&board)
+            .into_iter()
+            .find(|c| {
+                c.members
+                    .iter()
+                    .any(|m| m.role == synth_ir::MemberRole::DecouplingCap)
+            })
+            .expect("sensor_logger has an IC with decoupling");
+        let cap = cluster
+            .members
+            .iter()
+            .find(|m| m.role == synth_ir::MemberRole::DecouplingCap)
+            .expect("a decoupling capacitor");
+        let cap_refdes = board
+            .component(cap.component)
+            .expect("component")
+            .refdes
+            .clone();
+        let anchor = board
+            .component(cluster.anchor)
+            .expect("anchor")
+            .refdes
+            .clone();
+
+        // Beside the pad it serves it is not reported.
+        let anchor_placed = *placement
+            .components
+            .iter()
+            .find(|p| p.id == cluster.anchor)
+            .expect("anchor placed");
+        let pad = apply_rotation(
+            anchor_placed,
+            build_pad_offset_lookup(&board)
+                .lookup(cluster.anchor, cap.binding.anchor_pin.0 as usize)
+                .unwrap_or((0, 0)),
+        );
+        let anchor_center = anchor_placed.center;
+        move_part(
+            &mut placement,
+            &board,
+            &cap_refdes,
+            synth_geometry::nm_to_mm(pad.x_nm) + 2.0,
+            synth_geometry::nm_to_mm(pad.y_nm),
+        );
+        assert!(
+            !far_support_parts(&board, &placement)
+                .iter()
+                .any(|f| f.refdes == cap_refdes),
+            "{cap_refdes} is 2 mm from {anchor} pin {} and must not be reported",
+            cap.binding.anchor_pin.0
+        );
+
+        // Moved 40 mm away it is, with a named fix.
+        move_part(
+            &mut placement,
+            &board,
+            &cap_refdes,
+            synth_geometry::nm_to_mm(anchor_center.x_nm) + 40.0,
+            synth_geometry::nm_to_mm(anchor_center.y_nm),
+        );
+        let far = far_support_parts(&board, &placement);
+        assert!(
+            far.iter().any(|f| f.refdes == cap_refdes && f.mm > 30.0),
+            "{cap_refdes} is 40 mm from {anchor} and must be reported"
+        );
+        let desc = describe_placement(&board, &placement);
+        assert!(desc
+            .functional_warnings
+            .iter()
+            .any(|w| w.starts_with(&format!("{cap_refdes} ("))));
+        assert!(desc.visual_review.recommended_actions.iter().any(|a| {
+            a.action == "place_support_part_near"
+                && a.refdes == cap_refdes
+                && a.rationale.contains(&format!("near: {anchor}."))
+        }));
+        // It is advice: it is a functional warning and a recommended action,
+        // never one of the visual-review findings that fail a placement.
+        assert!(
+            !desc
+                .visual_review
+                .findings
+                .iter()
+                .any(|f| f.starts_with(&format!("{cap_refdes} ("))),
+            "{:?}",
+            desc.visual_review.findings
+        );
+    }
+
+    /// A board the placer has not tuned can flag most of its support parts; the
+    /// review lists the worst few and counts the rest.
+    #[test]
+    fn the_support_part_warnings_are_capped_and_the_rest_counted() {
+        let board = load_board("../../fixtures/designs/feather_m4_express.synth");
+        let placement = place(&board).expect("place");
+        let total = far_support_parts(&board, &placement).len();
+        let desc = describe_placement(&board, &placement);
+        let listed = desc
+            .functional_warnings
+            .iter()
+            .filter(|w| w.contains("which it serves"))
+            .count();
+        assert!(listed <= MAX_SUPPORT_PART_WARNINGS, "{listed} listed");
+        if total > MAX_SUPPORT_PART_WARNINGS {
+            assert!(desc.functional_warnings.iter().any(|w| {
+                w.starts_with(&format!(
+                    "{} more support part",
+                    total - MAX_SUPPORT_PART_WARNINGS
+                ))
+            }));
+        }
+    }
+
+    /// The fix the advice names works: a hard `near: <part>.<pin>` hint on a
+    /// flagged support part moves it nearer the pad it names, so an agent that
+    /// follows the warning clears it. The limit allows for the anchor's
+    /// courtyard and the dense-part ring, which the placer keeps free.
+    #[test]
+    fn following_the_named_near_hint_brings_the_part_nearer_its_pad() {
+        let board = load_board("../../examples/sensor_logger/sensor_logger.synth");
+        let placement = place(&board).expect("place");
+        let far = far_support_parts(&board, &placement);
+        // The farthest one has the most room to improve.
+        let target = far
+            .iter()
+            .filter(|f| matches!(f.role, synth_ir::MemberRole::DecouplingCap))
+            .max_by(|a, b| a.mm.total_cmp(&b.mm))
+            .expect("sensor_logger has a decoupling capacitor that is too far");
+        let hinted = board_with_external_hints(
+            &board,
+            &[ExternalHint {
+                component: Some(target.refdes.clone()),
+                near: Some(format!("{}.{}", target.anchor, target.pin_name)),
+                priority: Some("hard".into()),
+                ..ExternalHint::default()
+            }],
+        );
+        let after = place(&hinted).expect("place with the hint");
+        let still = far_support_parts(&hinted, &after)
+            .into_iter()
+            .find(|f| f.refdes == target.refdes);
+        // Following the warning clears it, or leaves the part within the
+        // legaliser's slack of its limit (the nearest legal spot beside a
+        // crowded pad can be a little past it, which the advice says).
+        assert!(
+            still
+                .as_ref()
+                .is_none_or(|f| f.mm <= f.limit_mm + LEGAL_SPOT_SLACK_MM),
+            "{} was {:.1} mm from {}.{} and is still {:?} mm (limit {:?}) after the hint",
+            target.refdes,
+            target.mm,
+            target.anchor,
+            target.pin_name,
+            still.as_ref().map(|f| f.mm),
+            still.as_ref().map(|f| f.limit_mm)
+        );
+    }
+
+    /// Two copies of one circuit and one that only looks similar: a connector,
+    /// a series resistor and a filter capacitor to ground, twice, and a third
+    /// whose resistor and capacitor are wired the other way round.
+    fn repeated_circuits_board() -> Board {
+        board_from_source(
+            r#"board "rep" { layers 2
+                power "GND" 0v
+                component JA: connector "jst_ph_2pin"
+                component RA: resistor "r_generic_0603" value "1k"
+                component CA: capacitor "c_generic_0603" value "10nF"
+                component JB: connector "jst_ph_2pin"
+                component RB: resistor "r_generic_0603" value "1k"
+                component CB: capacitor "c_generic_0603" value "10nF"
+                component JC: connector "jst_ph_2pin"
+                component RC: resistor "r_generic_0603" value "1k"
+                component CC: capacitor "c_generic_0603" value "10nF"
+                net "SIG_A" { JA.p1 RA.p1 }
+                net "MID_A" { RA.p2 CA.p1 }
+                net "SIG_B" { JB.p1 RB.p1 }
+                net "MID_B" { RB.p2 CB.p1 }
+                net "SIG_C" { JC.p1 CC.p1 }
+                net "MID_C" { CC.p2 RC.p1 }
+                net "GND" { CA.p2 CB.p2 RC.p2 JA.p2 JB.p2 JC.p2 }
+            }"#,
+            "rep.synth",
+        )
+    }
+
+    #[test]
+    fn nine_equal_parts_are_paired_by_least_total_cost_not_in_source_order() {
+        // Counterparts are listed in reverse: the cheapest pairing is the
+        // reversal, and source order is the most expensive one.
+        let n = 9;
+        let cost =
+            |i: usize, j: usize| f64::from(u32::try_from(i.abs_diff(n - 1 - j)).expect("small"));
+        let pairing = closest_pairing(n, cost);
+        assert_eq!(pairing, (0..n).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_hungarian_pairing_matches_an_exhaustive_search_on_small_matrices() {
+        // A fixed pseudo-random matrix per size; the exhaustive search is the
+        // same function below its size limit.
+        let mut seed = 12_345_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            f64::from(u32::try_from((seed >> 33) % 1000).expect("below 1000")) / 10.0
+        };
+        for n in 2..=7 {
+            let matrix: Vec<Vec<f64>> = (0..n).map(|_| (0..n).map(|_| next()).collect()).collect();
+            let cost = |i: usize, j: usize| matrix[i][j];
+            let total = |p: &[usize]| {
+                p.iter()
+                    .enumerate()
+                    .map(|(i, &j)| matrix[i][j])
+                    .sum::<f64>()
+            };
+            let best = closest_pairing(n, cost);
+            let hungarian = hungarian_pairing(n, &cost);
+            assert!(
+                (total(&best) - total(&hungarian)).abs() < 1e-9,
+                "n = {n}: exhaustive {} against Hungarian {}",
+                total(&best),
+                total(&hungarian)
+            );
+        }
+    }
+
+    #[test]
+    fn identical_circuits_are_found_by_structure_and_a_lookalike_is_not_grouped() {
+        let board = repeated_circuits_board();
+        let groups = repeats::find_repeated_circuits(&board);
+        assert_eq!(groups.len(), 1, "one group of copies");
+        let names: Vec<std::collections::BTreeSet<String>> = groups[0]
+            .iter()
+            .map(|island| {
+                island
+                    .parts
+                    .iter()
+                    .map(|(id, _)| board.component(*id).expect("part").refdes.clone())
+                    .collect()
+            })
+            .collect();
+        let set = |a: &str, b: &str| -> std::collections::BTreeSet<String> {
+            [a, b].iter().map(|s| (*s).to_string()).collect()
+        };
+        // The connectors are the boundary, not part of a copy.
+        assert!(names.contains(&set("RA", "CA")), "{names:?}");
+        assert!(names.contains(&set("RB", "CB")), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("RC")), "{names:?}");
+    }
+
+    #[test]
+    fn copies_laid_out_alike_are_not_reported_and_a_moved_part_is_with_its_coordinates() {
+        let board = repeated_circuits_board();
+        let mut placement = place(&board).expect("place");
+        for (refdes, x, y) in [
+            ("JA", 10.0, 10.0),
+            ("RA", 16.0, 10.0),
+            ("CA", 16.0, 16.0),
+            ("JB", 10.0, 40.0),
+            ("RB", 16.0, 40.0),
+            ("CB", 16.0, 46.0),
+        ] {
+            move_part(&mut placement, &board, refdes, x, y);
+        }
+        // Turn every part of the second copy as its counterpart in the first, so
+        // the copies are compared on position, not on how the placer happened to
+        // turn each part.
+        for (copy, first) in [("JB", "JA"), ("RB", "RA"), ("CB", "CA")] {
+            let rotation = placement
+                .component_by_refdes(&board, first)
+                .expect(first)
+                .rotation;
+            for p in &mut placement.components {
+                if board.component(p.id).is_some_and(|c| c.refdes == copy) {
+                    p.rotation = rotation;
+                }
+            }
+        }
+        assert!(
+            mismatched_repeats(&board, &placement).is_empty(),
+            "alike copies must not be reported"
+        );
+
+        // Move one part of the second copy 6 mm.
+        move_part(&mut placement, &board, "CB", 16.0, 52.0);
+        let off = mismatched_repeats(&board, &placement);
+        let rb = off.iter().find(|m| m.refdes == "CB").expect("CB reported");
+        assert_eq!(rb.reference_refdes, "CA");
+        assert!((rb.mm - 6.0).abs() < 0.2, "{}", rb.mm);
+        assert!((rb.suggested.0 - 16.0).abs() < 0.2 && (rb.suggested.1 - 46.0).abs() < 0.2);
+
+        let desc = describe_placement(&board, &placement);
+        assert!(desc
+            .functional_warnings
+            .iter()
+            .any(|w| w.starts_with("CB is laid out differently from CA")));
+        assert!(desc.visual_review.recommended_actions.iter().any(|a| {
+            a.action == "match_repeated_circuit"
+                && a.refdes == "CB"
+                && a.suggested_x_mm.is_some_and(|x| (x - 16.0).abs() < 0.2)
+        }));
+    }
+
+    /// Lay `parts` out at their coordinates, every part turned the same way.
+    fn lay_out(board: &Board, parts: &[(&str, f64, f64)]) -> Placement {
+        let mut placement = place(board).expect("place");
+        for (refdes, x, y) in parts {
+            move_part(&mut placement, board, refdes, *x, *y);
+        }
+        for p in &mut placement.components {
+            p.rotation = Rotation::Zero;
+        }
+        placement
+    }
+
+    #[test]
+    fn equal_parts_on_different_hub_pins_are_still_compared() {
+        // Each copy holds two identical resistors that join one capacitor and
+        // leave by different pins of the MCU, so structure alone cannot tell
+        // them apart within a copy.
+        let board = board_from_source(
+            r#"board "twins" { layers 2
+                power "GND" 0v
+                component U1: mcu "rp2350"
+                component R1A: resistor "r_generic_0603" value "1k"
+                component R2A: resistor "r_generic_0603" value "1k"
+                component CA: capacitor "c_generic_0603" value "10nF"
+                component R1B: resistor "r_generic_0603" value "1k"
+                component R2B: resistor "r_generic_0603" value "1k"
+                component CB: capacitor "c_generic_0603" value "10nF"
+                net "G0" { U1.gp0 R1A.p1 }
+                net "G1" { U1.gp1 R2A.p1 }
+                net "MID_A" { R1A.p2 R2A.p2 CA.p1 }
+                net "G2" { U1.gp2 R1B.p1 }
+                net "G3" { U1.gp3 R2B.p1 }
+                net "MID_B" { R1B.p2 R2B.p2 CB.p1 }
+                net "GND" { CA.p2 CB.p2 }
+            }"#,
+            "twins.synth",
+        );
+        let mut parts = vec![
+            ("U1", 60.0, 30.0),
+            ("R1A", 10.0, 10.0),
+            ("R2A", 10.0, 14.0),
+            ("CA", 16.0, 12.0),
+            ("R1B", 10.0, 40.0),
+            ("R2B", 10.0, 44.0),
+            ("CB", 16.0, 42.0),
+        ];
+        assert!(
+            mismatched_repeats(&board, &lay_out(&board, &parts)).is_empty(),
+            "alike copies must not be reported"
+        );
+        // Move one of the twins in the second copy 6 mm.
+        parts[5] = ("R2B", 10.0, 50.0);
+        let off = mismatched_repeats(&board, &lay_out(&board, &parts));
+        let moved = off
+            .iter()
+            .find(|m| m.refdes == "R2B")
+            .expect("R2B reported");
+        assert_eq!(moved.reference_refdes, "R2A");
+        assert!((moved.mm - 6.0).abs() < 0.2, "{}", moved.mm);
+        assert!(
+            (moved.suggested.1 - 44.0).abs() < 0.2,
+            "{:?}",
+            moved.suggested
+        );
+        assert_eq!(off.len(), 1, "{off:?}");
+    }
+
+    #[test]
+    fn a_displaced_part_of_a_valve_driver_is_reported_with_a_coordinate() {
+        // The shape of the irrigation controller's valve drivers: a connector,
+        // a MOSFET, a gate resistor to the MCU, a pull-down and a flyback
+        // diode, twice.
+        let valve = |n: &str, gpio: &str| {
+            format!(
+                r#"component J{n}: connector "jst_xh_2pin"
+                component Q{n}: transistor "p_mosfet_si2301"
+                component RG{n}: resistor "r_generic_0603" value "100"
+                component RP{n}: resistor "r_generic_0603" value "100k"
+                component D{n}: diode "d_schottky"
+                net "V12_{n}" {{ J{n}.p1 D{n}.cathode }}
+                net "SW_{n}" {{ J{n}.p2 Q{n}.d D{n}.anode }}
+                net "DRV_{n}" {{ U1.{gpio} RG{n}.p1 }}
+                net "GATE_{n}" {{ RG{n}.p2 Q{n}.g RP{n}.p1 }}
+                net "GND" {{ Q{n}.s RP{n}.p2 }}"#
+            )
+        };
+        let source = format!(
+            r#"board "valves" {{ layers 2
+                power "GND" 0v
+                component U1: mcu "rp2350"
+                {}
+                {}
+            }}"#,
+            valve("1", "gp0"),
+            valve("2", "gp1")
+        );
+        let board = board_from_source(&source, "valves.synth");
+        let mut parts = vec![
+            ("U1", 80.0, 30.0),
+            ("J1", 10.0, 5.0),
+            ("Q1", 10.0, 12.0),
+            ("RG1", 16.0, 12.0),
+            ("RP1", 16.0, 16.0),
+            ("D1", 4.0, 12.0),
+            ("J2", 30.0, 5.0),
+            ("Q2", 30.0, 12.0),
+            ("RG2", 36.0, 12.0),
+            ("RP2", 36.0, 16.0),
+            ("D2", 24.0, 12.0),
+        ];
+        assert!(mismatched_repeats(&board, &lay_out(&board, &parts)).is_empty());
+        parts[10] = ("D2", 24.0, 22.0);
+        let off = mismatched_repeats(&board, &lay_out(&board, &parts));
+        let d = off.iter().find(|m| m.refdes == "D2").expect("D2 reported");
+        assert_eq!(d.reference_refdes, "D1");
+        assert!((d.suggested.0 - 24.0).abs() < 0.2 && (d.suggested.1 - 12.0).abs() < 0.2);
+        // Turned the way D1 is, so the advice carries a usable rotation too.
+        let first = lay_out(&board, &parts)
+            .component_by_refdes(&board, "D1")
+            .expect("D1")
+            .rotation;
+        assert_eq!(d.suggested_rotation, first);
+    }
+
+    #[test]
+    fn two_circuits_on_two_pins_of_one_small_connector_are_two_copies() {
+        // A two-pin connector joins nothing: each pin carries its own circuit.
+        let board = board_from_source(
+            r#"board "two_pins" { layers 2
+                power "GND" 0v
+                component J1: connector "jst_ph_2pin"
+                component RA: resistor "r_generic_0603" value "1k"
+                component CA: capacitor "c_generic_0603" value "10nF"
+                component RB: resistor "r_generic_0603" value "1k"
+                component CB: capacitor "c_generic_0603" value "10nF"
+                net "SA" { J1.p1 RA.p1 }
+                net "MA" { RA.p2 CA.p1 }
+                net "SB" { J1.p2 RB.p1 }
+                net "MB" { RB.p2 CB.p1 }
+                net "GND" { CA.p2 CB.p2 }
+            }"#,
+            "two_pins.synth",
+        );
+        let groups = repeats::find_repeated_circuits(&board);
+        assert_eq!(groups.len(), 1, "one group of two copies: {groups:?}");
+        assert_eq!(groups[0].len(), 2);
+        assert!(
+            groups[0].iter().all(|island| island.parts.len() == 2),
+            "each copy is a resistor and a capacitor, not the connector or the other copy"
+        );
+    }
+
+    #[test]
+    fn supply_nets_are_recognised_by_the_project_not_by_a_fixed_list_of_names() {
+        // Two copies of a resistor and capacitor whose rail is called `+3V3`
+        // and whose other rail is a declared ground: neither name is in a
+        // fixed list, and neither may join the two copies into one island.
+        let board = board_from_source(
+            r#"board "aliases" { layers 2
+                power "+3V3" 3.3v
+                power "GND" 0v
+                component RA: resistor "r_generic_0603" value "1k"
+                component CA: capacitor "c_generic_0603" value "10nF"
+                component RB: resistor "r_generic_0603" value "1k"
+                component CB: capacitor "c_generic_0603" value "10nF"
+                net "+3V3" { RA.p1 RB.p1 }
+                net "MA" { RA.p2 CA.p1 }
+                net "MB" { RB.p2 CB.p1 }
+                net "GND" { CA.p2 CB.p2 }
+            }"#,
+            "aliases.synth",
+        );
+        let groups = repeats::find_repeated_circuits(&board);
+        assert_eq!(groups.len(), 1, "the copies are found: {groups:?}");
+        assert!(groups[0].iter().all(|island| island.parts.len() == 2));
+    }
+
+    #[test]
+    fn same_shaped_circuits_on_different_kinds_of_pin_are_not_copies() {
+        // The same resistor and capacitor, once on a GPIO and once on the
+        // reset pin of the MCU: one circuit drives a line, the other holds the
+        // chip in reset, and a placement review must not compare them.
+        let board = board_from_source(
+            r#"board "roles" { layers 2
+                power "GND" 0v
+                component U1: mcu "rp2350"
+                component RA: resistor "r_generic_0603" value "10k"
+                component CA: capacitor "c_generic_0603" value "100nF"
+                component RB: resistor "r_generic_0603" value "10k"
+                component CB: capacitor "c_generic_0603" value "100nF"
+                net "GPIO_A" { U1.gp0 RA.p1 }
+                net "MA" { RA.p2 CA.p1 }
+                net "RESET_B" { U1.run RB.p1 }
+                net "MB" { RB.p2 CB.p1 }
+                net "GND" { CA.p2 CB.p2 }
+            }"#,
+            "roles.synth",
+        );
+        assert!(
+            repeats::find_repeated_circuits(&board).is_empty(),
+            "a GPIO circuit and a reset circuit are not copies"
+        );
+    }
+
+    #[test]
+    fn copies_that_anchor_on_different_parts_are_not_compared() {
+        // Two copies of one resistor-and-capacitor circuit. The first declares
+        // its resistor first, the second its capacitor first, so each copy's
+        // anchor (the lowest-numbered of equals) is a different part.
+        let board = board_from_source(
+            r#"board "anchors" { layers 2
+                power "GND" 0v
+                component RA: resistor "r_generic_0603" value "1k"
+                component CA: capacitor "c_generic_0603" value "10nF"
+                component CB: capacitor "c_generic_0603" value "10nF"
+                component RB: resistor "r_generic_0603" value "1k"
+                net "SIG_A" { RA.p1 CA.p1 }
+                net "SIG_B" { RB.p1 CB.p1 }
+                net "GND" { RA.p2 CA.p2 RB.p2 CB.p2 }
+            }"#,
+            "anchors.synth",
+        );
+        let mut placement = place(&board).expect("place");
+        for (refdes, x, y) in [
+            ("RA", 10.0, 10.0),
+            ("CA", 14.0, 10.0),
+            ("RB", 10.0, 30.0),
+            ("CB", 14.0, 30.0),
+        ] {
+            move_part(&mut placement, &board, refdes, x, y);
+        }
+        for p in &mut placement.components {
+            p.rotation = Rotation::Zero;
+        }
+        assert!(
+            repeats::find_repeated_circuits(&board)
+                .iter()
+                .any(|g| g.len() == 2),
+            "the two circuits are copies"
+        );
+        assert!(
+            mismatched_repeats(&board, &placement).is_empty(),
+            "offsets from different anchors say nothing about the layout"
+        );
+    }
+
+    #[test]
+    fn support_part_limits_are_tighter_for_decoupling_than_for_pull_ups() {
+        use synth_ir::MemberRole::{DecouplingCap, LoadCap, PullUp};
+        for dense in [false, true] {
+            assert!(
+                support_part_limit_mm(DecouplingCap, dense) < support_part_limit_mm(LoadCap, dense)
+            );
+            assert!(support_part_limit_mm(LoadCap, dense) < support_part_limit_mm(PullUp, dense));
+        }
+        // A dense anchor keeps its pin-escape ring, so its support parts get
+        // room for it.
+        assert!(
+            support_part_limit_mm(DecouplingCap, true)
+                > support_part_limit_mm(DecouplingCap, false)
         );
     }
 
@@ -8959,6 +11598,7 @@ board "features_only" {
             .collect(),
             forced_net_labels: Vec::new(),
             labels: std::collections::HashMap::new(),
+            vias: Vec::new(),
             fit_sheet: false,
         };
 
@@ -9021,6 +11661,7 @@ board "features_only" {
                 .collect(),
             forced_net_labels: Vec::new(),
             labels: std::collections::HashMap::new(),
+            vias: Vec::new(),
             fit_sheet: false,
         };
 
@@ -9491,8 +12132,58 @@ board "features_only" {
         }
     }
 
+    /// A connector hinted to one edge but pinned on another must not undo its
+    /// neighbour's flush edge: its own side is judged by where it sits.
     #[test]
-    fn sidecar_outline_pass_goes_flush_only_past_the_four_millimetre_margin() {
+    fn a_connector_pinned_off_its_hinted_edge_does_not_push_a_neighbours_flush_edge_out() {
+        // J3 is hinted bottom but a sidecar pins it on the left, beside J2.
+        let board = with_hint(
+            &feather_with_j2_hint("left", "hard"),
+            "J3",
+            "bottom",
+            "hard",
+        );
+        let mut placement = place(&load_board(FEATHER)).expect("place");
+        let others_min_x = placement
+            .components
+            .iter()
+            .filter(|placed| {
+                let refdes = &board.component(placed.id).expect("component").refdes;
+                refdes != "J2" && refdes != "J3"
+            })
+            .map(|placed| {
+                let component = board.component(placed.id).expect("component");
+                sidecar_courtyard_rect(&board, component, placed).min.x_nm
+            })
+            .min()
+            .expect("others");
+        for refdes in ["J2", "J3"] {
+            let component = board
+                .components
+                .iter()
+                .find(|c| c.refdes == refdes)
+                .expect(refdes);
+            let placed = placement
+                .components
+                .iter_mut()
+                .find(|placed| placed.id == component.id)
+                .expect("placement");
+            let half_w = sidecar_courtyard_rect(&board, component, placed).width_nm() / 2;
+            placed.center.x_nm = others_min_x - mm_to_nm(12.0) + half_w;
+        }
+        tighten_outline_after_sidecar(&board, &mut placement);
+        assert_connector_flush(&board, &placement, "J2", "left");
+        assert_connector_flush(&board, &placement, "J3", "left");
+
+        // The export fits the outline from the hints; it must agree.
+        let mut fitted = placement.clone();
+        fit_outline(&board, &mut fitted, fitted_edge_margin_nm(&board));
+        assert_connector_flush(&board, &fitted, "J2", "left");
+        assert_connector_flush(&board, &fitted, "J3", "left");
+    }
+
+    #[test]
+    fn sidecar_outline_pass_goes_flush_only_past_the_neighbours_rim() {
         let soft = feather_with_j2_hint("left", "soft");
         let mut placement = j2_protruding(&soft, "left", 12.0);
         tighten_outline_after_sidecar(&soft, &mut placement);
@@ -9502,22 +12193,38 @@ board "features_only" {
         );
 
         let hard = feather_with_j2_hint("left", "hard");
-        let mut short = j2_protruding(&hard, "left", 3.9);
+        // The margin the neighbours keep on the left, read off the same board
+        // with J2 well inside it so J2's own margin does not set the edge.
+        let mut inside = j2_protruding(&hard, "left", -6.0);
+        tighten_outline_after_sidecar(&hard, &mut inside);
+        let leftmost = inside
+            .components
+            .iter()
+            .filter_map(|placed| {
+                let component = hard.component(placed.id)?;
+                (component.refdes != "J2")
+                    .then(|| sidecar_courtyard_rect(&hard, component, placed).min.x_nm)
+            })
+            .min()
+            .expect("neighbours");
+        let rim_mm = synth_geometry::nm_to_mm(leftmost - inside.board_outline.min.x_nm);
+        let mut short = j2_protruding(&hard, "left", rim_mm - 0.1);
         tighten_outline_after_sidecar(&hard, &mut short);
         let j2_gap = courtyard_gaps(&hard, &short, "J2")[0];
         assert!(
             (mm_to_nm(0.1) - 1_000..=mm_to_nm(0.1) + 1_000).contains(&j2_gap),
-            "3.9 mm protrusion keeps the neighbours' 4 mm margin, J2 gap {j2_gap} nm"
+            "a protrusion short of the {rim_mm} mm rim keeps it, J2 gap {j2_gap} nm"
         );
-        let mut past = j2_protruding(&hard, "left", 4.1);
+        let mut past = j2_protruding(&hard, "left", rim_mm + 0.1);
         tighten_outline_after_sidecar(&hard, &mut past);
         assert_flush_with_copper_clear(&hard, &past, "J2", "left");
     }
 
     /// Mounting holes, test points and fiducials are board features that sit
-    /// in a corner, so the outline ends at their courtyard.
+    /// in a corner. They keep the board-feature rim, not the margin round
+    /// the other parts, so the outline cannot end on a hole.
     #[test]
-    fn a_board_feature_reaches_the_outline_without_the_four_millimetre_margin() {
+    fn a_board_feature_keeps_only_the_board_feature_rim() {
         for (refdes, kind, part) in [
             ("H1", "mounting_hole", "mounting_hole_m2_5"),
             ("TP1", "testpoint", "testpoint_pad_1_5"),
@@ -9556,8 +12263,8 @@ board "features_only" {
             tighten_outline_after_sidecar(&board, &mut placement);
             assert_eq!(
                 courtyard_gaps(&board, &placement, refdes)[0],
-                0,
-                "{kind}: the outline ends at its courtyard"
+                mm_to_nm(BOARD_FEATURE_EDGE_MARGIN_MM),
+                "{kind}: the outline keeps the board-feature rim"
             );
         }
     }

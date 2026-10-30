@@ -1332,6 +1332,8 @@ mod tests {
             value: "100n".to_string(),
             count: 1,
             max_distance_mm: None,
+            to: None,
+            through: None,
         }];
         let b = board(
             vec![comp(0, "U1", "mcu", p)],

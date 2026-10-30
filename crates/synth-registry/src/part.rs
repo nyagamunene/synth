@@ -213,7 +213,7 @@ pub enum MatingFace {
     Left,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OperatingConditions {
     #[serde(default)]
     pub min_voltage_v: Option<f64>,
@@ -228,6 +228,18 @@ pub struct OperatingConditions {
     /// Junction-to-ambient thermal resistance, in degrees C per watt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thermal_resistance_c_per_w: Option<f64>,
+    /// Reverse breakdown (zener) voltage in volts, where the voltage is the
+    /// part's function: nominal, and the datasheet's minimum and maximum,
+    /// all at [`Self::breakdown_test_current_ma`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown_voltage_v: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown_voltage_min_v: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown_voltage_max_v: Option<f64>,
+    /// The current the breakdown voltage is specified at, in milliamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown_test_current_ma: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -283,6 +295,17 @@ pub struct RequiredDecoupling {
     pub count: u32,
     #[serde(default)]
     pub max_distance_mm: Option<f64>,
+    /// The pin whose net the capacitors' other terminal joins, for a
+    /// capacitor that does not go to ground: a buck's bootstrap capacitor
+    /// runs from `bs` to `sw`. `None` means the usual decoupling capacitor
+    /// on the net named by `net`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The kind of two-pin part between the pin named by `net` and the net
+    /// the capacitors sit on: a buck's output capacitor is on the far side of
+    /// the inductor from `sw`, so `net = "sw"`, `through = "inductor"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through: Option<String>,
 }
 
 impl Part {

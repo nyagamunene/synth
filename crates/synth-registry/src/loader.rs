@@ -80,6 +80,12 @@ pub enum LoadError {
 
     #[error("part {path}: invalid footprint dimensions ({message})")]
     InvalidFootprintDimensions { path: PathBuf, message: String },
+
+    #[error(
+        "part {path}: required_decoupling names pin `{pin}`, which the part does not have; \
+         a rule on a missing pin is never checked"
+    )]
+    UnknownDecouplingPin { path: PathBuf, pin: String },
 }
 
 /// Recursively load every `*.synth.toml` file under `root` into a
@@ -549,6 +555,17 @@ fn validate_part(path: &Path, part: &Part) -> Result<(), LoadError> {
                     dims.width_mm, dims.height_mm
                 ),
             });
+        }
+    }
+
+    for rule in &part.required_decoupling {
+        for pin in std::iter::once(&rule.net).chain(rule.to.as_ref()) {
+            if part.find_pin(pin).is_none() {
+                return Err(LoadError::UnknownDecouplingPin {
+                    path: path.to_path_buf(),
+                    pin: pin.clone(),
+                });
+            }
         }
     }
 

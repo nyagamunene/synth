@@ -539,6 +539,94 @@ impl ErcRule for NoConnectMismatchRule {
 
 struct MissingDecouplingRule;
 
+/// The capacitors one `required_decoupling` rule counts, and the nets involved.
+struct DecouplingSite<'a> {
+    /// The net carrying the rule's pin.
+    pin_net: &'a synth_ir::Net,
+    /// The net the capacitors sit on: `pin_net`, or the far side of the
+    /// series part the rule goes `through`. `None` when that part is absent.
+    cap_net: Option<&'a synth_ir::Net>,
+    /// The capacitors on `cap_net` that satisfy the rule's shape: any
+    /// capacitor on the net, or only those whose other terminal is on the
+    /// net of the rule's `to` pin.
+    caps: Vec<&'a Component>,
+}
+
+/// The net on the far side of a two-pin part of kind `kind` that sits on
+/// `net`, other than `component` itself.
+fn series_far_net<'a>(
+    board: &'a Board,
+    component: &Component,
+    net: &'a synth_ir::Net,
+    kind: &str,
+) -> Option<&'a synth_ir::Net> {
+    net.endpoints.iter().find_map(|e| {
+        if e.component == component.id {
+            return None;
+        }
+        let series = board.component(e.component)?;
+        let part = series.part.as_ref()?;
+        if part.kind != kind || part.pins.len() != 2 {
+            return None;
+        }
+        let other = PinId(u32::from(e.pin.0 == 0));
+        board
+            .nets_containing(series.id, other)
+            .next()
+            .map(|(_, far)| far)
+    })
+}
+
+/// Locate what a `required_decoupling` rule asks for on `component`. `None`
+/// when the rule's pin (or its `to` pin) is floating: `E-SYNTH-CONNECT-001`
+/// owns that, so it is not flagged twice.
+fn decoupling_site<'a>(
+    board: &'a Board,
+    component: &Component,
+    part: &synth_registry::Part,
+    rule: &synth_registry::RequiredDecoupling,
+) -> Option<DecouplingSite<'a>> {
+    let net_of_pin = |name: &str| {
+        let idx = part.pins.iter().position(|p| p.name == name)?;
+        board
+            .nets_containing(component.id, PinId(idx as u32))
+            .next()
+    };
+    let (_, pin_net) = net_of_pin(&rule.net)?;
+    let to_net = match rule.to.as_deref() {
+        Some(name) => Some(net_of_pin(name)?.0),
+        None => None,
+    };
+    let cap_net = match rule.through.as_deref() {
+        Some(kind) => series_far_net(board, component, pin_net, kind),
+        None => Some(pin_net),
+    };
+    let caps = cap_net
+        .map(|net| {
+            net.endpoints
+                .iter()
+                .filter_map(|e| {
+                    let cap = board.component(e.component)?;
+                    if cap.part.as_ref()?.kind != "capacitor" {
+                        return None;
+                    }
+                    let Some(want) = to_net else {
+                        return Some(cap);
+                    };
+                    let other = PinId(u32::from(e.pin.0 == 0));
+                    let (far, _) = board.nets_containing(cap.id, other).next()?;
+                    (far == want).then_some(cap)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(DecouplingSite {
+        pin_net,
+        cap_net,
+        caps,
+    })
+}
+
 fn next_free_refdes_number(board: &Board, prefix: &str) -> i64 {
     board
         .components
@@ -620,27 +708,11 @@ impl ErcRule for MissingDecouplingRule {
                 continue;
             };
             for decoupling in &part.required_decoupling {
-                // Locate the pin on THIS part matching the
-                // decoupling.net key, then find its global net.
-                let Some(pin_idx) = part.pins.iter().position(|p| p.name == decoupling.net) else {
+                let Some(site) = decoupling_site(board, component, part, decoupling) else {
                     continue;
                 };
-                let pid = PinId(pin_idx as u32);
-                let Some((_, net)) = board.nets_containing(component.id, pid).next() else {
-                    // Pin floating — E-SYNTH-CONNECT-001 will already
-                    // have fired. Don't double-flag.
-                    continue;
-                };
-                let cap_count = net
-                    .endpoints
-                    .iter()
-                    .filter(|e| {
-                        board
-                            .component(e.component)
-                            .and_then(|c| c.part.as_ref())
-                            .is_some_and(|p| p.kind == "capacitor")
-                    })
-                    .count();
+                let net = site.pin_net;
+                let cap_count = site.caps.len();
                 let required = decoupling.count as usize;
                 if cap_count < required {
                     let mut builder = DiagnosticBuilder::new(
@@ -649,20 +721,46 @@ impl ErcRule for MissingDecouplingRule {
                         "missing decoupling capacitors",
                     )
                     .location(Location::from_span(file.to_string(), component.source_span))
-                    .expected(format!(
-                        "{required} capacitor(s) on the net carrying {}",
-                        component.describe_pin(&decoupling.net),
-                    ))
-                    .found(format!(
-                        "{cap_count} capacitor(s) found on net `{}`",
-                        net.name,
-                    ))
+                    .expected(match (&decoupling.to, &decoupling.through) {
+                        (Some(to), _) => format!(
+                            "{required} capacitor(s) between {} and {}",
+                            component.describe_pin(&decoupling.net),
+                            component.describe_pin(to),
+                        ),
+                        (None, Some(kind)) => format!(
+                            "{required} capacitor(s) on the net behind the `{kind}` on {}",
+                            component.describe_pin(&decoupling.net),
+                        ),
+                        (None, None) => format!(
+                            "{required} capacitor(s) on the net carrying {}",
+                            component.describe_pin(&decoupling.net),
+                        ),
+                    })
+                    .found(match (&decoupling.through, site.cap_net) {
+                        (Some(kind), None) => format!(
+                            "no `{kind}` on net `{}`, so no net to hold the capacitor(s)",
+                            net.name,
+                        ),
+                        (_, Some(cap_net)) => {
+                            format!("{cap_count} capacitor(s) found on net `{}`", cap_net.name)
+                        }
+                        (None, None) => {
+                            unreachable!("without `through` the capacitors sit on the pin's net")
+                        }
+                    })
                     .explanation_url(format!("synth.docs/diagnostics/{}", self.code()))
                     .smt_constraint(format!("(assert (>= decoupling_count {required}))"));
 
                     // Auto-insert the missing cap(s) into the source
-                    // when a ground net is available to complete them.
-                    if let Some(gnd_pin) = ground_pin_for(board, component) {
+                    // when the pin they return to is known: ground, or the
+                    // rule's `to` pin. A capacitor behind a series part has
+                    // no pin of this part to start from.
+                    let return_pin = match decoupling.to.as_deref() {
+                        Some(to) => Some(to.to_string()),
+                        None if decoupling.through.is_none() => ground_pin_for(board, component),
+                        None => None,
+                    };
+                    if let Some(gnd_pin) = return_pin {
                         let shortfall = required - cap_count;
                         builder = builder.suggested_fix(synth_diagnostics::Patch {
                             confidence: 0.9,
@@ -722,20 +820,15 @@ impl ErcRule for DecouplingValueRule {
                 let Some(required_f) = parse_capacitance(&decoupling.value) else {
                     continue;
                 };
-                let Some(pin_idx) = part.pins.iter().position(|p| p.name == decoupling.net) else {
-                    continue;
-                };
-                let pid = PinId(pin_idx as u32);
-                let Some((_, net)) = board.nets_containing(component.id, pid).next() else {
+                let Some(site) = decoupling_site(board, component, part, decoupling) else {
                     // Pin floating — E-SYNTH-CONNECT-001 owns that.
                     continue;
                 };
-                let caps: Vec<&Component> = net
-                    .endpoints
-                    .iter()
-                    .filter_map(|e| board.component(e.component))
-                    .filter(|c| c.part.as_ref().is_some_and(|p| p.kind == "capacitor"))
-                    .collect();
+                let Some(net) = site.cap_net else {
+                    // The series part is missing — POWER-001 owns that.
+                    continue;
+                };
+                let caps = site.caps;
                 if caps.is_empty() {
                     // No caps at all — POWER-001 owns the count check.
                     continue;
@@ -2352,9 +2445,12 @@ impl ErcRule for RequiredProcessOfferedRule {
                     requirement.as_source()
                 ))
                 .found(format!(
-                    "`requires {}` against profile `{}`, which does not offer it",
+                    "`requires {}` against profile `{}`, which does not offer it; \
+                     declare `manufacturer \"{}\"` to use it",
                     requirement.as_source(),
-                    profile.name
+                    profile.name,
+                    synth_drc::ManufacturerProfile::OFFERING_VIA_IN_PAD
+                        .join("\"` or `manufacturer \"")
                 ))
                 .explanation_url(format!("synth.docs/diagnostics/{}", self.code()))
                 .build()
@@ -4184,6 +4280,23 @@ mod tests {
         .is_empty());
     }
 
+    /// A refusal that names no way out leaves an agent guessing at profile
+    /// names; one run tried `jlcpcb` and `jlc-advanced` and gave up.
+    #[test]
+    fn the_refusal_names_the_profile_that_offers_the_process() {
+        let board = board_requiring_via_in_pad(Some("jlcpcb"));
+        let reported = RequiredProcessOfferedRule {
+            via_in_pad_override: false,
+        }
+        .check(&board, "test.synth");
+        assert_eq!(reported.len(), 1);
+        let found = reported[0].found.clone().unwrap_or_default();
+        assert!(
+            found.contains("manufacturer \"jlc-filled-via\""),
+            "the refusal must name the profile to declare: {found}"
+        );
+    }
+
     #[test]
     fn an_operator_override_silences_only_the_requirement_it_signed_for() {
         // `--krt-allow-via-in-pad` is an operator taking responsibility for
@@ -4604,6 +4717,8 @@ mod tests {
             value: "10u".into(),
             count: 1,
             max_distance_mm: None,
+            to: None,
+            through: None,
         }];
         let cap = part(
             "c",

@@ -10,6 +10,7 @@
 
 pub mod audit;
 pub mod cloud_endpoint;
+mod findings;
 pub mod server;
 pub mod tools;
 

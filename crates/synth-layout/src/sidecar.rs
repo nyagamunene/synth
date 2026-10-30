@@ -208,6 +208,11 @@ pub struct SidecarLayout {
     /// these, so they belong in `<design>.placement.layout.toml`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, SidecarLabel>,
+    /// Vias the design fixes by hand, such as a thermal array under an
+    /// exposed pad. The PCB export writes them before routing, so the router
+    /// sees them as existing copper of their net.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vias: Vec<SidecarVia>,
     /// Force the sheet to the smallest size that fits the drawing, with the
     /// drawing centred on it.
     /// Applied *after* the auto-layout, because the pipeline re-derives
@@ -280,6 +285,14 @@ pub enum OverrideSource {
 pub enum OverridePriority {
     Soft,
     Hard,
+}
+
+/// A via placed by hand, in board millimetres, on a named net.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SidecarVia {
+    pub x: f64,
+    pub y: f64,
+    pub net: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,6 +568,30 @@ hide = true
         assert!(sidecar.labels.is_empty());
         let written = toml::to_string(&sidecar).unwrap();
         assert!(!written.contains("[labels"), "{written}");
+    }
+
+    #[test]
+    fn a_sidecar_without_vias_has_none_and_writes_none_back() {
+        let sidecar: SidecarLayout = toml::from_str("[components.U1]\nx = 1.0\ny = 2.0\n").unwrap();
+        assert!(sidecar.vias.is_empty());
+        let written = toml::to_string(&sidecar).unwrap();
+        assert!(!written.contains("vias"), "{written}");
+    }
+
+    #[test]
+    fn vias_survive_a_round_trip() {
+        let toml = "[[vias]]\nx = 33.0\ny = 16.0\nnet = \"GND\"\n";
+        let sidecar: SidecarLayout = toml::from_str(toml).unwrap();
+        assert_eq!(
+            sidecar.vias,
+            vec![SidecarVia {
+                x: 33.0,
+                y: 16.0,
+                net: "GND".into()
+            }]
+        );
+        let again: SidecarLayout = toml::from_str(&toml::to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!(again.vias, sidecar.vias);
     }
 
     #[test]

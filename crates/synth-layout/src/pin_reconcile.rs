@@ -124,6 +124,10 @@ pub struct PowerDriver {
     pub anchor_pin_name: String,
     /// Center (mm) of the anchor component's placement.
     pub anchor_center: (f64, f64),
+    /// Terminal `(x, y, dx, dy)` of the anchor pin on the sheet, set when the
+    /// anchor is drawn from a generated symbol: there is no stock symbol to
+    /// read it from.
+    pub anchor_terminal: Option<(f64, f64, f64, f64)>,
 }
 
 /// Result of reconciling one component's symbol pin set against the
@@ -278,34 +282,66 @@ pub fn undriven_power_nets<S: ::std::hash::BuildHasher>(
         }
         if has_power_input && !has_registry_power_output && !has_symbol_power_output {
             // Pick the first power-input endpoint with a placement as
-            // the anchor for the flag's stub.
+            // the anchor for the flag's stub. A pin of a part with a stock
+            // symbol is preferred; a generated symbol is the fallback, so a
+            // board whose only power pins sit on generated symbols is still
+            // driven.
             let mut anchor = None;
-            for endpoint in &net.endpoints {
-                let Some(component) = board.component(endpoint.component) else {
-                    continue;
-                };
-                let Some(part) = component.part.as_ref() else {
-                    continue;
-                };
-                let Some(pin) = part.pins.get(endpoint.pin.0 as usize) else {
-                    continue;
-                };
-                if pin.electrical_type != synth_registry::ElectricalType::PowerInput
-                    && pin.electrical_type != synth_registry::ElectricalType::GroundReference
-                {
-                    continue;
+            for generated in [false, true] {
+                if anchor.is_some() {
+                    break;
                 }
-                let Some(placement) = placements.get(&endpoint.component) else {
-                    continue;
-                };
-                anchor = Some(PowerDriver {
-                    net: net.id,
-                    anchor_component: endpoint.component,
-                    anchor_pin_number: pin.number.0.clone(),
-                    anchor_pin_name: pin.name.clone(),
-                    anchor_center: placement.center_mm,
-                });
-                break;
+                for endpoint in &net.endpoints {
+                    let Some(component) = board.component(endpoint.component) else {
+                        continue;
+                    };
+                    let Some(part) = component.part.as_ref() else {
+                        continue;
+                    };
+                    let Some(pin) = part.pins.get(endpoint.pin.0 as usize) else {
+                        continue;
+                    };
+                    if pin.electrical_type != synth_registry::ElectricalType::PowerInput
+                        && pin.electrical_type != synth_registry::ElectricalType::GroundReference
+                    {
+                        continue;
+                    }
+                    // The flag's stub starts at the pin's terminal. A stock
+                    // symbol gives it from its library file; a generated
+                    // one from the body Synth draws.
+                    if part.kicad_symbol.is_none() != generated {
+                        continue;
+                    }
+                    let Some(placement) = placements.get(&endpoint.component) else {
+                        continue;
+                    };
+                    let anchor_terminal = if generated {
+                        let by_id: std::collections::HashMap<
+                            ComponentId,
+                            &crate::ComponentPlacement,
+                        > = placements.iter().map(|(id, p)| (*id, *p)).collect();
+                        let Some(terminal) = crate::route::pin_terminal_xy(
+                            board,
+                            endpoint.component,
+                            endpoint.pin,
+                            &by_id,
+                        ) else {
+                            continue;
+                        };
+                        Some(terminal)
+                    } else {
+                        None
+                    };
+                    anchor = Some(PowerDriver {
+                        net: net.id,
+                        anchor_component: endpoint.component,
+                        anchor_pin_number: pin.number.0.clone(),
+                        anchor_pin_name: pin.name.clone(),
+                        anchor_center: placement.center_mm,
+                        anchor_terminal,
+                    });
+                    break;
+                }
             }
             if let Some(anchor) = anchor {
                 out.push(anchor);

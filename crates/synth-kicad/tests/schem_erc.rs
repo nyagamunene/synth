@@ -211,6 +211,8 @@ fn decoupling_board() -> Board {
         value: "100n".to_string(),
         count: 1,
         max_distance_mm: None,
+        to: None,
+        through: None,
     }];
     let mut cap_part = part("capacitor");
     cap_part.required_decoupling = Vec::new();
