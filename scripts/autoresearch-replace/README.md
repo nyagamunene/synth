@@ -8,6 +8,7 @@ with hard routing gates and a 2% wire cap.
 
     dead_mm2 + 0.25 * area_mm2 + 200 * connector_violations
             + 50 * label_overlaps + 100 * labels_off_board
+            + 0.02 * wire_length_mm + 0.1 * vias
 
 Lower is better. Fitness is a gate, not a score term: the 0-100 composite is
 never summed into the objective. A keep requires a tuning drop of at least one

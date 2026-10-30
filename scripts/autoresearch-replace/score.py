@@ -27,6 +27,9 @@ LABEL_OVERLAP_WEIGHT = 50.0
 LABEL_OFF_WEIGHT = 100.0
 AREA_WEIGHT = 0.25
 CORNER_MM = 20.0
+# Densification cost: packing that adds wire or vias should not look free.
+WIRE_WEIGHT = 0.02
+VIA_WEIGHT = 0.1
 
 # Score hermetically: a per-user Tier-2 registry must not shadow the corpus parts.
 os.environ["SYNTH_USER_REGISTRY_DIR"] = tempfile.mkdtemp(prefix="ar-shape-user-")
@@ -523,6 +526,13 @@ def score_board(synth_bin, design, out_dir, krt_repo, krt_python, registry=None)
     if g["ok"] and g.get("wire_length_mm") is None:
         g["ok"] = False
         g["why"] = "routing record missing wire_length_mm"
+    if g["ok"] and g.get("score") is not None:
+        g["score"] = round(
+            g["score"]
+            + WIRE_WEIGHT * (g.get("wire_length_mm") or 0)
+            + VIA_WEIGHT * (g.get("vias") or 0),
+            2,
+        )
     g["wall_s"] = round(time.monotonic() - start, 1)
     return g
 

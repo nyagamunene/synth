@@ -9,6 +9,7 @@ The score is
 
     dead_mm2 + 0.25 * area_mm2 + 200 * connector_violations
             + 50 * label_overlaps + 100 * labels_off_board
+            + 0.02 * wire_length_mm + 0.1 * vias
 
 summed over the tuning corpus; lower is better. Every board must export with
 0 open nets, 0 KiCad DRC errors and 0 unconnected pads. A keep also requires a
