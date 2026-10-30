@@ -154,6 +154,157 @@ pub(crate) fn region_assign(
     RegionAssignment { hints }
 }
 
+/// The quadratic initial placement for the RePlAce solver: component ids,
+/// centres, rotations and the free mask, in board order.
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+pub(crate) fn initial_positions(
+    board: &Board,
+    usable: Rect,
+    _baseline: &crate::Placement,
+    fp_targets: &HashMap<ComponentId, FloorplanTarget>,
+    rotation_overrides: &HashMap<ComponentId, Rotation>,
+    pinned: &PinnedPlacements,
+    courtyard_lookup: &HashMap<ComponentId, (f64, f64)>,
+    pad_offsets: &PadOffsetLookup,
+) -> (Vec<ComponentId>, Vec<Point>, Vec<Rotation>, Vec<bool>) {
+    let anchors = hard_anchor_positions(
+        board,
+        usable,
+        fp_targets,
+        rotation_overrides,
+        pinned,
+        _baseline,
+    );
+    let mut ids = Vec::with_capacity(board.components.len());
+    let mut index = HashMap::with_capacity(board.components.len());
+    for (position, component) in board.components.iter().enumerate() {
+        ids.push(component.id);
+        index.insert(component.id, position);
+    }
+    let free: Vec<bool> = ids.iter().map(|id| !anchors.contains_key(id)).collect();
+    let rotations: Vec<Rotation> = ids
+        .iter()
+        .map(|id| {
+            anchors.get(id).map_or_else(
+                || {
+                    rotation_overrides
+                        .get(id)
+                        .copied()
+                        .unwrap_or(Rotation::Zero)
+                },
+                |(_, rotation)| *rotation,
+            )
+        })
+        .collect();
+    let half: Vec<(f64, f64)> = ids
+        .iter()
+        .enumerate()
+        .map(|(position, id)| {
+            let (w_mm, h_mm) = courtyard_lookup.get(id).copied().unwrap_or((10.0, 10.0));
+            rotated_half_extents(
+                rotations[position],
+                mm_to_nm(w_mm) as f64,
+                mm_to_nm(h_mm) as f64,
+            )
+        })
+        .collect();
+    let anchor_points: Vec<Option<(f64, f64)>> = ids
+        .iter()
+        .map(|id| {
+            anchors
+                .get(id)
+                .map(|(point, _)| (point.x_nm as f64, point.y_nm as f64))
+        })
+        .collect();
+    let dense: Vec<bool> = ids
+        .iter()
+        .map(|id| crate::is_dense_part(board, *id))
+        .collect();
+    let nets = net_endpoints(board, &index, &rotations, pad_offsets);
+    let problem = Problem {
+        free: free.clone(),
+        anchors: anchor_points,
+        half,
+        dense,
+        nets,
+        usable,
+        spacing_nm: 0.0,
+    };
+    let centres = solve(&problem);
+    (ids, centres, rotations, free)
+}
+
+/// The truly mechanical anchors for a continuous placement.
+///
+/// Floorplan targets are hints the greedy scanner can move; freezing all of
+/// them makes a different arrangement illegal before legalization starts.
+/// Connectors keep the default placement's legal edge position (the baseline
+/// already respects their hints), hard absolute hints anchor their part, and
+/// sidecar pins win over both.
+#[allow(clippy::implicit_hasher)]
+fn hard_anchor_positions(
+    board: &Board,
+    usable: Rect,
+    fp_targets: &HashMap<ComponentId, FloorplanTarget>,
+    rotation_overrides: &HashMap<ComponentId, Rotation>,
+    pinned: &PinnedPlacements,
+    baseline: &crate::Placement,
+) -> HashMap<ComponentId, (Point, Rotation)> {
+    let mut anchors: HashMap<ComponentId, (Point, Rotation)> = pinned
+        .iter()
+        .map(|(id, (point, rotation))| (*id, (*point, *rotation)))
+        .collect();
+    let baseline_by_id: HashMap<ComponentId, (Point, Rotation)> = baseline
+        .components
+        .iter()
+        .map(|placed| (placed.id, (placed.center, placed.rotation)))
+        .collect();
+    let no_relative_hints: HashMap<String, Rect> = HashMap::new();
+    for component in &board.components {
+        if anchors.contains_key(&component.id) {
+            continue;
+        }
+        let hint = component.placement_hint.as_ref();
+        let mechanical_edge = hint.is_some_and(|hint| hint.edge.is_some());
+        let mechanical_kind = matches!(component.kind.as_str(), "connector" | "jack");
+        let hard_region = hint.is_some_and(|hint| {
+            hint.priority == synth_ir::PlacementPriority::Hard && hint.region.is_some()
+        });
+        if !mechanical_edge && !mechanical_kind && !hard_region {
+            continue;
+        }
+        if mechanical_kind {
+            if let Some((point, rotation)) = baseline_by_id.get(&component.id) {
+                anchors.insert(component.id, (*point, *rotation));
+                continue;
+            }
+        }
+        let hint_target = hint.and_then(|hint| {
+            let absolute = hint.edge.is_some()
+                || (hint.priority == synth_ir::PlacementPriority::Hard && hint.region.is_some());
+            absolute
+                .then(|| crate::resolve_hint_target(hint, usable, &no_relative_hints).target)
+                .flatten()
+        });
+        let target =
+            hint_target.or_else(|| fp_targets.get(&component.id).map(|target| target.point));
+        let Some(point) = target else {
+            continue;
+        };
+        let rotation = fp_targets.get(&component.id).map_or_else(
+            || {
+                rotation_overrides
+                    .get(&component.id)
+                    .copied()
+                    .unwrap_or(Rotation::Zero)
+            },
+            |target| target.rotation,
+        );
+        anchors.insert(component.id, (point, rotation));
+    }
+    anchors
+}
+
 /// Resolve the parts the existing pipeline already fixes, in the same
 /// precedence order as the target-point search.
 ///

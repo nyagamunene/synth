@@ -80,6 +80,8 @@ pub mod cem;
 pub mod floorplan;
 pub mod modules;
 pub mod outline_packer;
+mod replace;
+pub mod replace_params;
 pub mod score;
 
 use serde::{Deserialize, Serialize};
@@ -1239,6 +1241,108 @@ pub fn place_with_analytic_seed_and_sidecar(
         0,
         SeedMode::Analytic { spacing_mm: 0.0 },
     )
+}
+
+/// Full RePlAce-style analytical placement.
+///
+/// The default [`place`] supplies the outline, usable rectangle and layers;
+/// the RePlAce solve (weighted-average wirelength plus Poisson density,
+/// optimised with Nesterov) owns the continuous geometry; the
+/// displacement-minimising legalizer makes it a valid PCB placement. This is
+/// an opt-in experiment, not the production default.
+pub fn place_with_replace(board: &Board) -> Result<Placement, PlaceError> {
+    use synth_layout::pcb_courtyard_geometry_for_part;
+
+    let baseline = place(board)?;
+    if !board.nets.iter().any(|net| net.endpoints.len() >= 2) {
+        return Ok(baseline);
+    }
+    let outline = baseline.board_outline;
+    let usable = outline;
+    let courtyards_mm: Vec<(ComponentId, (f64, f64), (f64, f64))> = board
+        .components
+        .iter()
+        .map(|component| {
+            let (width, height) = component.part.as_ref().map_or_else(
+                || fallback_courtyard(&component.kind),
+                |part| pcb_courtyard_geometry_for_part(part).1,
+            );
+            (component.id, PLACEMENT_COURTYARD_OFFSET_MM, (width, height))
+        })
+        .collect();
+    let courtyard_lookup: std::collections::HashMap<ComponentId, (f64, f64)> = courtyards_mm
+        .iter()
+        .map(|(id, _, size)| (*id, *size))
+        .collect();
+    let fp_targets = floorplan::compute_floorplan_targets(board, usable, &courtyard_lookup);
+    let rotation_overrides = default_rotation_overrides(board);
+    let pad_offsets = build_pad_offset_lookup(board);
+    let pinned = PinnedPlacements::new();
+    let params = crate::replace_params::RePlAceParams::default();
+    let continuous = crate::replace::continuous_replace(
+        board,
+        outline,
+        usable,
+        &baseline,
+        &fp_targets,
+        &rotation_overrides,
+        &pinned,
+        &courtyard_lookup,
+        &pad_offsets,
+        params,
+    );
+    if std::env::var_os("SYNTH_DEBUG_REPLACE").is_some() {
+        let score = crate::score::score_placement(board, &continuous.placement);
+        eprintln!(
+            "REPLACE continuous: hpwl {:.1} mm",
+            synth_geometry::nm_to_mm(score.hpwl_total_nm)
+        );
+    }
+    let legalized = legalize_continuous(
+        board,
+        continuous.placement,
+        continuous.frozen,
+        &courtyard_lookup,
+        usable,
+        params.legalizer_gap_mm,
+    );
+    let Ok(mut placement) = legalized else {
+        if std::env::var_os("SYNTH_DEBUG_REPLACE").is_some() {
+            eprintln!("REPLACE legalizer failed: {:?}", legalized.err());
+        }
+        return Ok(baseline);
+    };
+    if std::env::var_os("SYNTH_DEBUG_REPLACE").is_some() {
+        let score = crate::score::score_placement(board, &placement);
+        let review = describe_placement(board, &placement).visual_review;
+        eprintln!(
+            "REPLACE legalized: hpwl {:.1} mm visual {:?}",
+            synth_geometry::nm_to_mm(score.hpwl_total_nm),
+            review.requires_revision
+        );
+    }
+    if describe_placement(board, &placement)
+        .visual_review
+        .requires_revision
+    {
+        let refined = refine_placement(board, &placement, &rotation_overrides, &pinned);
+        if !describe_placement(board, &refined)
+            .visual_review
+            .requires_revision
+        {
+            placement = refined;
+        }
+    }
+    let baseline_hpwl = crate::score::score_placement(board, &baseline).hpwl_total_nm;
+    let placement_hpwl = crate::score::score_placement(board, &placement).hpwl_total_nm;
+    if describe_placement(board, &placement)
+        .visual_review
+        .requires_revision
+        || placement_hpwl > baseline_hpwl
+    {
+        return Ok(baseline);
+    }
+    Ok(placement)
 }
 
 /// `place()` with the production defaults, optionally without compaction.
@@ -6105,6 +6209,178 @@ fn compact_placement(board: &Board, placement: Placement) -> Placement {
         }
     }
     current
+}
+
+/// Legalize a continuous placement without changing its rotations or layers.
+///
+/// Force-directed overlap removal preserves the arrangement; a deterministic
+/// greedy nearest-legal fallback handles the residual overlaps a dense board
+/// leaves. `frozen` is aligned with `placement.components`.
+fn legalize_continuous(
+    board: &Board,
+    mut placement: Placement,
+    frozen: Vec<bool>,
+    courtyard_lookup: &std::collections::HashMap<ComponentId, (f64, f64)>,
+    usable: Rect,
+    gap_mm: f64,
+) -> Result<Placement, PlaceError> {
+    let sizes: Vec<(f64, f64)> = placement
+        .components
+        .iter()
+        .zip(&frozen)
+        .map(|(placed, &is_frozen)| {
+            let (width, height) = courtyard_lookup
+                .get(&placed.id)
+                .copied()
+                .unwrap_or((10.0, 10.0));
+            if is_frozen {
+                (width, height)
+            } else {
+                (width + gap_mm, height + gap_mm)
+            }
+        })
+        .collect();
+    clamp_free(&mut placement, &sizes, &frozen, usable);
+    for _ in 0..4 {
+        let clear = separate_overlaps(&mut placement, &sizes, &frozen);
+        clamp_free(&mut placement, &sizes, &frozen, usable);
+        if clear {
+            break;
+        }
+    }
+    if legalizer_overlaps(&placement, &sizes).is_some() {
+        greedy_legalize(&mut placement, &sizes, &frozen, usable);
+    }
+    if let Some((first, _)) = legalizer_overlaps(&placement, &sizes) {
+        let refdes = board
+            .component(placement.components[first].id)
+            .map_or_else(|| "board".to_string(), |component| component.refdes.clone());
+        return Err(PlaceError::NoLegalPosition {
+            refdes,
+            board_w_mm: synth_geometry::nm_to_mm(placement.board_outline.width_nm()),
+            board_h_mm: synth_geometry::nm_to_mm(placement.board_outline.height_nm()),
+            tried: placement.components.len(),
+        });
+    }
+    Ok(placement)
+}
+
+fn legalizer_overlaps(placement: &Placement, sizes: &[(f64, f64)]) -> Option<(usize, usize)> {
+    for first in 0..placement.components.len() {
+        let a = rotated_courtyard_rect(&placement.components[first], sizes[first]);
+        for second in (first + 1)..placement.components.len() {
+            let b = rotated_courtyard_rect(&placement.components[second], sizes[second]);
+            if a.intersects(&b) {
+                return Some((first, second));
+            }
+        }
+    }
+    None
+}
+
+/// Clamp every free centre so its rotated courtyard stays inside `usable`.
+fn clamp_free(placement: &mut Placement, sizes: &[(f64, f64)], frozen: &[bool], usable: Rect) {
+    for (index, placed) in placement.components.iter_mut().enumerate() {
+        if frozen[index] {
+            continue;
+        }
+        let rect = rotated_courtyard_rect(placed, sizes[index]);
+        let half_w = rect.width_nm() / 2;
+        let half_h = rect.height_nm() / 2;
+        let min_x = usable.min.x_nm + half_w;
+        let max_x = usable.max.x_nm - half_w;
+        let min_y = usable.min.y_nm + half_h;
+        let max_y = usable.max.y_nm - half_h;
+        placed.center.x_nm = if min_x > max_x {
+            (min_x + max_x) / 2
+        } else {
+            placed.center.x_nm.clamp(min_x, max_x)
+        };
+        placed.center.y_nm = if min_y > max_y {
+            (min_y + max_y) / 2
+        } else {
+            placed.center.y_nm.clamp(min_y, max_y)
+        };
+    }
+}
+
+/// Place the remaining free parts one at a time at the nearest legal slot.
+fn greedy_legalize(placement: &mut Placement, sizes: &[(f64, f64)], frozen: &[bool], usable: Rect) {
+    let mut placed = frozen.to_vec();
+    let mut free: Vec<usize> = (0..placement.components.len())
+        .filter(|&index| !frozen[index])
+        .collect();
+    free.sort_by_key(|&index| {
+        (
+            std::cmp::Reverse(mm_to_nm(sizes[index].0).saturating_mul(mm_to_nm(sizes[index].1))),
+            placement.components[index].id,
+        )
+    });
+    for index in free {
+        let current = placement.components[index].center;
+        if candidate_is_legal(placement, index, &placed, sizes, usable, current) {
+            placed[index] = true;
+            continue;
+        }
+        if let Some(center) = nearest_legal_center(placement, index, &placed, sizes, usable) {
+            placement.components[index].center = center;
+        }
+        placed[index] = true;
+    }
+}
+
+fn nearest_legal_center(
+    placement: &Placement,
+    index: usize,
+    placed: &[bool],
+    sizes: &[(f64, f64)],
+    usable: Rect,
+) -> Option<Point> {
+    const MAX_STEPS: i64 = 80;
+    let step_nm = mm_to_nm(0.5);
+    let base = placement.components[index].center;
+    let mut offsets: Vec<(i64, i64)> = Vec::new();
+    for dx in -MAX_STEPS..=MAX_STEPS {
+        for dy in -MAX_STEPS..=MAX_STEPS {
+            offsets.push((dx, dy));
+        }
+    }
+    offsets.sort_by_key(|(dx, dy)| (dx * dx + dy * dy, *dx, *dy));
+    offsets.into_iter().find_map(|(dx, dy)| {
+        let center = Point::new(base.x_nm + dx * step_nm, base.y_nm + dy * step_nm);
+        candidate_is_legal(placement, index, placed, sizes, usable, center).then_some(center)
+    })
+}
+
+fn candidate_is_legal(
+    placement: &Placement,
+    index: usize,
+    placed: &[bool],
+    sizes: &[(f64, f64)],
+    usable: Rect,
+    center: Point,
+) -> bool {
+    let candidate = ComponentPlacement {
+        center,
+        ..placement.components[index]
+    };
+    let rect = rotated_courtyard_rect(&candidate, sizes[index]);
+    if rect.min.x_nm < usable.min.x_nm
+        || rect.min.y_nm < usable.min.y_nm
+        || rect.max.x_nm > usable.max.x_nm
+        || rect.max.y_nm > usable.max.y_nm
+    {
+        return false;
+    }
+    placement
+        .components
+        .iter()
+        .enumerate()
+        .all(|(other_index, other)| {
+            other_index == index
+                || !placed[other_index]
+                || !rect.intersects(&rotated_courtyard_rect(other, sizes[other_index]))
+        })
 }
 
 /// Move passives into under-occupied interior bins, then squeeze the passive
