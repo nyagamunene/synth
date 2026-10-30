@@ -278,12 +278,16 @@ $(tail -n 8 $LOG)"
   fi
 done
 
-section "test"
-say "test: scoring the unseen corpus once"
-test_score=$(total $AR/corpus_test.txt test)
-test_wire=$(wire_total $AR/corpus_test.txt test)
-test_gates=$(gates_total $AR/corpus_test.txt test)
-say "TEST score $test_score wire $test_wire gates $test_gates"
+if [ "$MAX_EXP" -gt 0 ]; then
+  section "test"
+  say "test: scoring the unseen corpus once"
+  test_score=$(total $AR/corpus_test.txt test)
+  test_wire=$(wire_total $AR/corpus_test.txt test)
+  test_gates=$(gates_total $AR/corpus_test.txt test)
+  say "TEST score $test_score wire $test_wire gates $test_gates"
+else
+  say "baseline only: test corpus not scored"
+fi
 say "fitness debt: tuning $best_gates_t / held-out $best_gates_h"
 if [ "${REQUIRE_CLEAN:-0}" = "1" ] && [ $((best_gates_t + best_gates_h)) -gt 0 ]; then
   finish "fitness debt remains" 1
