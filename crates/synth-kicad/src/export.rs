@@ -242,12 +242,12 @@ pub fn placement_for_export(
 /// Candidate placements for a caller that can route and wants to choose.
 ///
 /// A superset of what [`export_with_sidecars`] itself chooses among: the
-/// export's own candidates, a spread of placement-margin variants, and the
+/// export's own winner, a spread of placement-margin variants, and the
 /// unspaced/spaced analytical seeds, so a place→route→re-place loop has
 /// genuinely different arrangements to route. Ordered deterministically,
-/// duplicates removed. The first entry is the hinted placement; the export's
-/// own route-free choice is [`placement_for_export`], which ranks the base set
-/// by route-aware legality and area.
+/// duplicates removed. The first entry is the export's route-free winner
+/// ([`placement_for_export`]); it leads so an equal route keeps the smaller
+/// board.
 ///
 /// # Errors
 /// [`ExportError::Placement`] when the placer finds no legal placement.
@@ -255,8 +255,22 @@ pub fn placement_candidates(
     board: &Board,
     sidecars: &Sidecars,
 ) -> Result<Vec<synth_place::Placement>, ExportError> {
-    place_candidates_with_margins(board, sidecars.placement_path(), &[0.5, 2.5], &[1, 2], true)
-        .map_err(|source| ExportError::Placement { source })
+    let mut candidates = Vec::new();
+    // The export winner is the smallest placement the route-free path would
+    // ship. Offer it to the router first: if routing ties, the smaller board
+    // wins instead of a route-loop-only arrangement the export never saw.
+    if let Ok(export) = place_for_export(board, sidecars.placement_path()) {
+        candidates.push(export);
+    }
+    for candidate in
+        place_candidates_with_margins(board, sidecars.placement_path(), &[0.5, 2.5], &[1, 2], true)
+            .map_err(|source| ExportError::Placement { source })?
+    {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
 }
 
 fn export_inner(
