@@ -17,18 +17,24 @@ LOGDIR=logs/autoresearch-replace
 NOTE=$PWD/ar-note.txt
 FOCUS=${FOCUS:-"tune replace_params.rs: reduce dead space and area, routability first"}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
-mkdir -p $LOGDIR
+mkdir -p "$LOGDIR"
 pid=
+START_SECONDS=$SECONDS
 
 stamp() { date +%H:%M:%S; }
-say() { printf '[%s] %s\n' "$(stamp)" "$*" | tee -a $LOGDIR/loop.log >&2; }
-dbg() { printf '[%s]   %s\n' "$(stamp)" "$*" >>$LOGDIR/loop.log; }
 dur() { printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
+elapsed() { dur $((SECONDS - START_SECONDS)); }
+say() { printf '[%s +%s] %s\n' "$(stamp)" "$(elapsed)" "$*" | tee -a "$LOGDIR/loop.log" >&2; }
+dbg() { printf '[%s +%s]   %s\n' "$(stamp)" "$(elapsed)" "$*" >>"$LOGDIR/loop.log"; }
+section() { say "===== $* ====="; }
 delta() { awk -v a="$1" -v b="$2" 'BEGIN { if (a + 0 == a) printf "%.1f (%+.1f)", a, a - b; else printf "%s", a }'; }
 log() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$LOG"; }
 revert() { git reset -q --hard HEAD && git clean -fdq -- crates; }
 finish() {
-  say "stopping: $1${base_t:+  | tuning $base_t -> ${best_t:-?}, held-out $base_h -> ${best_h:-?}}"
+  say "STOP: $1"
+  say "summary: elapsed $(elapsed)${base_t:+ | tuning $base_t -> ${best_t:-?} | held-out $base_h -> ${best_h:-?}}"
+  say "logs: $LOGDIR/loop.log | table: $LOG | per-round: $LOGDIR/"
+  say "cleaning cargo target..."
   cargo clean -q
   exit "${2:-0}"
 }
@@ -53,10 +59,51 @@ wire_total() {
   awk '/^WIRE/ {print $2}' "$LOGDIR/$file.log"
 }
 build() {
-  cargo build --release -p synth-cli >build.log 2>&1 && return 0
-  say "build FAILED: $(grep -m1 '^error' build.log | cut -c1-110)"
-  dbg "build log tail:"; tail -n 15 build.log >>$LOGDIR/loop.log
+  local b0=$SECONDS
+  if cargo build --release -p synth-cli >build.log 2>&1; then
+    say "build ok in $(dur $((SECONDS - b0)))"
+    return 0
+  fi
+  say "build FAILED after $(dur $((SECONDS - b0))): $(grep -m1 '^error' build.log | cut -c1-140)"
+  dbg "build log tail:"; tail -n 25 build.log >>"$LOGDIR/loop.log"
   return 1
+}
+board_report() {
+  local file=$1 label=$2
+  python3 - "$file" "$label" <<'PY' | tee -a "$LOGDIR/loop.log" >&2
+import json, sys
+
+path, label = sys.argv[1], sys.argv[2]
+
+
+def num(value):
+    return 0 if value is None else value
+
+
+print(f"  {label}:")
+print(f"    {'board':<34} {'score':>9} {'dead':>7} {'area':>8} {'wire':>8} {'open':>5} {'drc':>4}")
+for line in open(path):
+    line = line.strip()
+    if not line or line.startswith(("SCORE", "WIRE")):
+        continue
+    parts = line.split(" ", 1)
+    if len(parts) != 2:
+        continue
+    name, blob = parts
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        continue
+    board = name.rsplit("/", 1)[-1].replace(".synth", "")
+    if not data.get("ok"):
+        print(f"    {board:<34} FAIL {str(data.get('why', ''))[:90]}")
+        continue
+    print(
+        f"    {board:<34} {num(data.get('score')):>9.1f} {num(data.get('dead_mm2')):>7.0f} "
+        f"{num(data.get('area_mm2')):>8.1f} {num(data.get('wire_length_mm')):>8.1f} "
+        f"{num(data.get('open')):>5} {num(data.get('errors')):>4}"
+    )
+PY
 }
 
 GUARD=$(mktemp -d)
@@ -74,13 +121,18 @@ exec $REAL_CARGO "\$@"
 EOF
 chmod +x "$GUARD/cargo"
 
-say "start: model=$MODEL rounds<=$MAX_EXP focus=$FOCUS"
+say "start: experiment=$(basename "$PWD") model=$MODEL rounds<=$MAX_EXP discards<=$MAX_DISCARDS budget=${MAX_SECONDS}s"
+say "corpus: tuning $(wc -l <"$AR/corpus_tuning.txt") boards, held-out $(wc -l <"$AR/corpus_heldout.txt") boards"
+say "focus: $FOCUS"
+say "table: $LOG | agent: $AR | logs: $LOGDIR"
 git diff --quiet -- crates || finish "uncommitted changes under crates/, refusing to start" 1
 git add $AR && git commit -qsm "NOISSUE - replace params autoresearch harness" >/dev/null 2>&1
 [ -f $LOG ] || printf 'round\tcommit\ttuning_score\theldout_score\ttuning_wire\theldout_wire\tstatus\tnote\n' >$LOG
+
+section "baseline"
 say "baseline: building"
 build || finish "baseline build failed" 1
-say "baseline: scoring"
+say "baseline: scoring ($(wc -l <"$AR/corpus_tuning.txt") tuning + $(wc -l <"$AR/corpus_heldout.txt") held-out boards)"
 best_t=$(total $AR/corpus_tuning.txt tuning); best_h=$(total $AR/corpus_heldout.txt heldout)
 best_w=$(wire_total $AR/corpus_tuning.txt tuning); best_hw=$(wire_total $AR/corpus_heldout.txt heldout)
 case $best_t in ""|*FAIL*) finish "baseline tuning did not score, see $LOGDIR/tuning.log" 1;; esac
@@ -88,7 +140,9 @@ case $best_h in ""|*FAIL*) finish "baseline held-out did not score, see $LOGDIR/
 case $best_w in ""|*FAIL*) finish "baseline tuning wire missing, see $LOGDIR/tuning.log" 1;; esac
 case $best_hw in ""|*FAIL*) finish "baseline held-out wire missing, see $LOGDIR/heldout.log" 1;; esac
 base_t=$best_t; base_h=$best_h; base_w=$best_w; base_hw=$best_hw
-say "baseline: tuning $base_t (wire $base_w), held-out $base_h (wire $base_hw)"
+board_report "$LOGDIR/tuning.log" "baseline tuning"
+board_report "$LOGDIR/heldout.log" "baseline held-out"
+say "baseline: tuning $base_t (wire $base_w), held-out $base_h (wire $base_hw), elapsed $(elapsed)"
 log 0 "$(git rev-parse --short HEAD)" "$best_t" "$best_h" "$best_w" "$best_hw" baseline "start"
 
 start=$SECONDS; discards=0
@@ -96,7 +150,8 @@ for i in $(seq 1 "$MAX_EXP"); do
   [ $((SECONDS - start)) -lt "$MAX_SECONDS" ] || finish "time limit"
   [ "$discards" -lt "$MAX_DISCARDS" ] || finish "$MAX_DISCARDS discards in a row"
   r="r$i/$MAX_EXP"
-  say "$r start    best: tuning $best_t, held-out $best_h  (discards in a row: $discards)"
+  section "$r"
+  say "$r start: elapsed $(elapsed), budget left $(dur $((MAX_SECONDS - (SECONDS - start)))), best tuning $best_t / held-out $best_h, discards $discards"
   rm -f $NOTE
   prompt="$(sed "s|/tmp/ar-note.txt|$NOTE|g" $AR/program.md)
 
@@ -119,24 +174,30 @@ $(tail -n 8 $LOG)"
     [ $((tick % 5)) = 0 ] && say "$r agent still working ($(dur $((SECONDS - t0))))"
   done
   wait $pid; code=$?; pid=
-  dbg "agent exit $code; last lines:"; tail -n 5 "$alog" | cut -c1-160 | sed 's/^/    /' >>$LOGDIR/loop.log
+  adur=$(dur $((SECONDS - t0)))
+  dbg "agent exit $code; last lines:"; tail -n 8 "$alog" | cut -c1-160 | sed 's/^/    /' >>"$LOGDIR/loop.log"
+  if [ "$code" -ne 0 ]; then
+    say "$r agent exit $code after $adur (log: $alog)"
+    tail -n 3 "$alog" | cut -c1-180 | sed 's/^/    /' | tee -a "$LOGDIR/loop.log" >&2
+  else
+    say "$r agent done in $adur"
+  fi
   note=$(head -c 160 $NOTE 2>/dev/null | tr '\t\n' '  ')
   dbg "note: ${note:-none}"
-  adur=$(dur $((SECONDS - t0)))
   git add -N -- crates 2>/dev/null
 
   if git diff --quiet -- crates; then
-    say "$r NOOP     agent $adur, no edit${note:+  ($note)}"
+    say "$r NOOP agent $adur, no edit${note:+ ($note)}"
     log "$i" - - - - - noop "${note:-no change}"; discards=$((discards + 1)); continue
   fi
   files=$(git diff --name-only -- crates | xargs -n1 basename | paste -sd, -)
-  say "$r agent    $adur  $(git diff --numstat -- crates | awk '{a += $1; d += $2} END {printf "+%d/-%d", a, d}')  [$files]"
+  say "$r agent $adur $(git diff --numstat -- crates | awk '{a += $1; d += $2} END {printf "+%d/-%d", a, d}') [$files]"
   if git diff --name-only | grep -Evq '^crates/(synth-place|synth-layout|synth-kicad)/src/'; then
-    say "$r REJECT   touched files outside the allowed folders"
+    say "$r REJECT touched files outside the allowed folders"
     revert; log "$i" - - - - - rejected "touched frozen files"; discards=$((discards + 1)); continue
   fi
   if git diff | grep -Eq '^-.*#\[test\]'; then
-    say "$r REJECT   removed a test"
+    say "$r REJECT removed a test"
     revert; log "$i" - - - - - rejected "removed a test"; discards=$((discards + 1)); continue
   fi
   say "$r building"
@@ -144,21 +205,23 @@ $(tail -n 8 $LOG)"
     revert; log "$i" - - - - - crash "build failed: $note"; discards=$((discards + 1)); continue
   fi
 
-  say "$r scoring  ($(wc -l <$AR/corpus_tuning.txt) tuning + $(wc -l <$AR/corpus_heldout.txt) held-out boards)"
+  say "$r scoring ($(wc -l <$AR/corpus_tuning.txt) tuning + $(wc -l <$AR/corpus_heldout.txt) held-out boards)"
   t=$(total $AR/corpus_tuning.txt tuning "tuning-$i"); h=$(total $AR/corpus_heldout.txt heldout "heldout-$i")
   w_t=$(wire_total $AR/corpus_tuning.txt tuning "tuning-$i"); w_h=$(wire_total $AR/corpus_heldout.txt heldout "heldout-$i")
+  board_report "$LOGDIR/tuning-$i.log" "$r tuning"
+  board_report "$LOGDIR/heldout-$i.log" "$r held-out"
   failed=$(grep -h '"ok": false' $LOGDIR/tuning-$i.log $LOGDIR/heldout-$i.log | awk '{n = split($1, a, "/"); printf "%s ", a[n]}')
   lognote="$note${failed:+ [failed: $failed]}"
   dt=$(delta "$t" "$best_t"); dh=$(delta "$h" "$best_h")
   if python3 -c "import sys; sys.path.insert(0,'$AR'); import score; sys.exit(0 if score.should_keep(*sys.argv[1:9]) else 1)" "$t" "$h" "$best_t" "$best_h" "$w_t" "$w_h" "$best_w" "$best_hw"; then
     git add -A crates && git commit -qsm "NOISSUE - replace params research round $i: ${lognote:-change}"
     c=$(git rev-parse --short HEAD)
-    say "$r KEEP     tuning $dt  held-out $dh  wire $w_t/$w_h  $c  ${note:0:70}"
+    say "$r KEEP tuning $dt | held-out $dh | wire $w_t/$w_h | commit $c | elapsed $(elapsed) | ${note:0:70}"
     log "$i" "$c" "$t" "$h" "$w_t" "$w_h" keep "$lognote"
     best_t=$t; best_h=$h; best_w=$w_t; best_hw=$w_h; discards=0
   else
     revert; discards=$((discards + 1))
-    say "$r DISCARD  tuning $dt  held-out $dh  wire $w_t/$w_h${failed:+  failed: $failed}  ${note:0:60}"
+    say "$r DISCARD tuning $dt | held-out $dh | wire $w_t/$w_h${failed:+ | failed: $failed} | elapsed $(elapsed) | ${note:0:60}"
     log "$i" - "$t" "$h" "$w_t" "$w_h" discard "$lognote"
   fi
 done
