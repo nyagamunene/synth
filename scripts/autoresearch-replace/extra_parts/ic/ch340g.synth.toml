@@ -1,0 +1,111 @@
+id = "ch340g"
+kind = "ic"
+version = 0
+lifecycle = "active"
+description = "WCH CH340G USB to UART bridge controller, SOP-16"
+mpn = "CH340G"
+lcsc_pn = "C14267"
+kicad_symbol = "Interface_USB:CH340G"
+kicad_footprint = "Package_SO:SOIC-16_3.9x9.9mm_P1.27mm"
+
+[footprint_dimensions]
+width_mm = 7.4
+height_mm = 10.4
+courtyard_margin_mm = 0.25
+
+[operating_conditions]
+min_voltage_v = 2.9
+max_voltage_v = 5.3
+max_current_ma = 20.0
+
+[[pins]]
+name = "gnd"
+number = "1"
+electrical_type = "power_input"
+required = true
+
+[[pins]]
+name = "txd"
+number = "2"
+electrical_type = "output"
+capabilities = ["uart_tx"]
+
+[[pins]]
+name = "rxd"
+number = "3"
+electrical_type = "input"
+capabilities = ["uart_rx"]
+
+[[pins]]
+name = "v3"
+number = "4"
+electrical_type = "passive"
+required = true
+
+[[pins]]
+name = "ud_plus"
+number = "5"
+electrical_type = "differential_positive"
+capabilities = ["usb_dp"]
+
+[[pins]]
+name = "ud_minus"
+number = "6"
+electrical_type = "differential_negative"
+capabilities = ["usb_dn"]
+
+[[pins]]
+name = "xi"
+number = "7"
+electrical_type = "input"
+
+[[pins]]
+name = "xo"
+number = "8"
+electrical_type = "output"
+
+[[pins]]
+name = "cts"
+number = "9"
+electrical_type = "input"
+
+[[pins]]
+name = "dsr"
+number = "10"
+electrical_type = "input"
+
+[[pins]]
+name = "ri"
+number = "11"
+electrical_type = "input"
+
+[[pins]]
+name = "dcd"
+number = "12"
+electrical_type = "input"
+
+[[pins]]
+name = "dtr"
+number = "13"
+electrical_type = "output"
+
+[[pins]]
+name = "rts"
+number = "14"
+electrical_type = "output"
+
+[[pins]]
+name = "r232"
+number = "15"
+electrical_type = "input"
+
+[[pins]]
+name = "vcc"
+number = "16"
+electrical_type = "power_input"
+required = true
+
+[[required_decoupling]]
+net = "vcc"
+value = "100nf"
+count = 1

@@ -1,0 +1,34 @@
+id = "ant_helical_433mhz"
+kind = "antenna"
+description = "Helical 433MHz antenna, through-hole"
+# `Device:Antenna` is the single-pin symbol, and this footprint has two
+# copper pads. A pin number has to exist in the symbol as well as the
+# footprint, or the schematic and the board talk to different pins, so the
+# second pad needs the two-pin symbol.
+kicad_symbol = "Device:Antenna_Shield"
+kicad_footprint = "RF_Antenna:Pulse_W3011"
+
+[footprint_dimensions]
+width_mm = 5.0
+height_mm = 5.0
+courtyard_margin_mm = 0.25
+
+[operating_conditions]
+min_voltage_v = 1.8
+max_voltage_v = 5.0
+max_current_ma = 100.0
+
+[[pins]]
+name = "feed"
+number = "1"
+electrical_type = "rf"
+capabilities = ["rf_feed"]
+required = true
+
+# `RF_Antenna:Pulse_W3011` has two copper pads: the feed and the grounded
+# mounting pad. Only the feed was declared, so the second read as a pad no pin
+# owned.
+[[pins]]
+name = "shield"
+number = "2"
+electrical_type = "passive"

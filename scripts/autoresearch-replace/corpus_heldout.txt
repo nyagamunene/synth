@@ -1,0 +1,4 @@
+fixtures/layout/ldo_block.synth
+fixtures/layout/divider.synth
+fixtures/layout/mcu.synth
+examples/placement_and_diff_pair/placement_and_diff_pair.synth
