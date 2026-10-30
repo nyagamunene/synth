@@ -8,9 +8,20 @@
 //!
 //! Units are millimetres unless stated otherwise.
 
+/// Which density force the Nesterov step uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DensityModel {
+    /// Bin-overlap density (research note Option A), the stable first model.
+    Bin,
+    /// Poisson/electrostatic density on a DCT grid (research note Option B).
+    Poisson,
+}
+
 /// One RePlAce run's equation knobs.
 #[derive(Clone, Copy, Debug)]
 pub struct RePlAceParams {
+    /// Density force model.
+    pub density_model: DensityModel,
     /// Density grid is `bin_count x bin_count` over the usable rectangle.
     pub bin_count: usize,
     /// Number of gamma/lambda stages.
@@ -40,6 +51,7 @@ pub struct RePlAceParams {
 impl Default for RePlAceParams {
     fn default() -> Self {
         Self {
+            density_model: DensityModel::Bin,
             bin_count: 64,
             stages: 6,
             iterations_per_stage: 40,

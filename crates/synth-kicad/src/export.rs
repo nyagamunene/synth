@@ -727,6 +727,13 @@ fn place_for_export(
     board: &Board,
     sidecar: Option<&Path>,
 ) -> Result<synth_place::Placement, synth_place::PlaceError> {
+    // Local experiment seam for the RePlAce params loop; production never sets
+    // it. The route-free export still validates and fits the outline below.
+    if std::env::var_os("SYNTH_PLACE_REPLACE").is_some() {
+        if let Ok(placement) = synth_place::place_with_replace(board) {
+            return Ok(placement);
+        }
+    }
     Ok(place_candidates(board, sidecar)?
         .into_iter()
         .min_by_key(|placement| placement_key(board, placement))

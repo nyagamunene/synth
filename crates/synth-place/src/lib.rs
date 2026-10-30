@@ -1258,7 +1258,6 @@ pub fn place_with_replace(board: &Board) -> Result<Placement, PlaceError> {
         return Ok(baseline);
     }
     let outline = baseline.board_outline;
-    let usable = outline;
     let courtyards_mm: Vec<(ComponentId, (f64, f64), (f64, f64))> = board
         .components
         .iter()
@@ -1274,6 +1273,19 @@ pub fn place_with_replace(board: &Board) -> Result<Placement, PlaceError> {
         .iter()
         .map(|(id, _, size)| (*id, *size))
         .collect();
+    let baseline_sizes: Vec<(f64, f64)> = baseline
+        .components
+        .iter()
+        .map(|placed| {
+            courtyard_lookup
+                .get(&placed.id)
+                .copied()
+                .unwrap_or((10.0, 10.0))
+        })
+        .collect();
+    // Keep free parts inside the baseline non-connector envelope so a
+    // connector row stays the outermost feature on its edge.
+    let usable = non_connector_envelope(board, &baseline, &baseline_sizes).unwrap_or(outline);
     let fp_targets = floorplan::compute_floorplan_targets(board, usable, &courtyard_lookup);
     let rotation_overrides = default_rotation_overrides(board);
     let pad_offsets = build_pad_offset_lookup(board);
@@ -1312,13 +1324,32 @@ pub fn place_with_replace(board: &Board) -> Result<Placement, PlaceError> {
         }
         return Ok(baseline);
     };
+    // The default outline is fitted around the baseline; the RePlAce
+    // arrangement has its own envelope, so fit the outline before the visual
+    // review and HPWL comparison.
+    tighten_outline_to_hints(board, &mut placement);
+    let origin = placement.board_outline.min;
+    for placed in &mut placement.components {
+        placed.center = Point::new(
+            placed.center.x_nm - origin.x_nm,
+            placed.center.y_nm - origin.y_nm,
+        );
+    }
+    placement.board_outline = Rect::new(
+        Point::new(0, 0),
+        Point::new(
+            placement.board_outline.width_nm(),
+            placement.board_outline.height_nm(),
+        ),
+    );
     if std::env::var_os("SYNTH_DEBUG_REPLACE").is_some() {
         let score = crate::score::score_placement(board, &placement);
         let review = describe_placement(board, &placement).visual_review;
         eprintln!(
-            "REPLACE legalized: hpwl {:.1} mm visual {:?}",
+            "REPLACE legalized: hpwl {:.1} mm visual {:?} findings {:?}",
             synth_geometry::nm_to_mm(score.hpwl_total_nm),
-            review.requires_revision
+            review.requires_revision,
+            review.findings
         );
     }
     if describe_placement(board, &placement)

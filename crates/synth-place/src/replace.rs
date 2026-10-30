@@ -15,7 +15,7 @@ use synth_ir::{Board, ComponentId};
 
 use crate::analytic::initial_positions;
 use crate::floorplan::FloorplanTarget;
-use crate::replace_params::RePlAceParams;
+use crate::replace_params::{DensityModel, RePlAceParams};
 use crate::{ComponentPlacement, PadOffsetLookup, PinnedPlacements, Placement};
 
 /// Continuous RePlAce output plus the frozen mask aligned with its components.
@@ -104,9 +104,13 @@ pub(crate) fn continuous_replace(
         let gamma =
             (params.gamma_start_mm * params.gamma_decay.powi(stage_index)).max(params.gamma_end_mm);
         let lambda = params.lambda_start * params.lambda_growth.powi(stage_index);
-        let self_forces: Vec<(f64, f64)> = (0..current.len())
-            .map(|index| grid.self_force(current[index], sizes[index], total_area))
-            .collect();
+        let self_forces: Vec<(f64, f64)> = if params.density_model == DensityModel::Poisson {
+            (0..current.len())
+                .map(|index| grid.self_force(current[index], sizes[index], total_area))
+                .collect()
+        } else {
+            Vec::new()
+        };
         for _iteration in 0..params.iterations_per_stage {
             let t_next = 0.5 * (1.0 + (1.0 + 4.0 * t * t).sqrt());
             let momentum = ((t - 1.0) / t_next).max(0.0);
@@ -137,13 +141,18 @@ pub(crate) fn continuous_replace(
                 params.net_weight,
                 &mut gradient,
             );
-            let density = grid.density_gradient(
-                &momentum_positions,
-                &sizes,
-                &frozen,
-                total_area,
-                &self_forces,
-            );
+            let density = match params.density_model {
+                DensityModel::Bin => {
+                    grid.bin_density_gradient(&momentum_positions, &sizes, &frozen, total_area)
+                }
+                DensityModel::Poisson => grid.density_gradient(
+                    &momentum_positions,
+                    &sizes,
+                    &frozen,
+                    total_area,
+                    &self_forces,
+                ),
+            };
             if std::env::var_os("SYNTH_DEBUG_REPLACE").is_some() && stage == 0 && _iteration == 0 {
                 let max = density
                     .iter()
@@ -604,6 +613,108 @@ impl DensityGrid {
         gradient
     }
 
+    /// Bin-overlap density gradient (research note Option A). No self-force:
+    /// the kernel's derivative is zero at its own centre, and the penalty is
+    /// a local function of the bin coverage.
+    fn bin_density_gradient(
+        &self,
+        positions: &[(f64, f64)],
+        sizes: &[(f64, f64)],
+        frozen: &[bool],
+        total_area: f64,
+    ) -> Vec<(f64, f64)> {
+        let m = self.m;
+        let target = total_area / (m * m) as f64;
+        let mut coverage = vec![0.0_f64; m * m];
+        for (position, size) in positions.iter().zip(sizes) {
+            let (support, norm) = self.kernel_support(*position, *size);
+            if norm <= 0.0 {
+                continue;
+            }
+            let area = size.0 * size.1;
+            for (l, j, theta_x, theta_y) in support {
+                coverage[l * m + j] += area * theta_x * theta_y / norm;
+            }
+        }
+        let mut gradient = vec![(0.0_f64, 0.0_f64); positions.len()];
+        for index in 0..positions.len() {
+            if frozen[index] {
+                continue;
+            }
+            let (support, norm) = self.kernel_support(positions[index], sizes[index]);
+            if norm <= 0.0 {
+                continue;
+            }
+            let area = sizes[index].0 * sizes[index].1;
+            let scale = area / norm;
+            let kernel_w = sizes[index].0.max(self.bin_w);
+            let kernel_h = sizes[index].1.max(self.bin_h);
+            let mut force_x = 0.0;
+            let mut force_y = 0.0;
+            for (l, j, theta_x, theta_y) in support {
+                let center_x = self.min_x + (l as f64 + 0.5) * self.bin_w;
+                let center_y = self.min_y + (j as f64 + 0.5) * self.bin_h;
+                let dx = positions[index].0 - center_x;
+                let dy = positions[index].1 - center_y;
+                let derivative_x = kernel_derivative(dx.abs(), kernel_w) * dx.signum();
+                let derivative_y = kernel_derivative(dy.abs(), kernel_h) * dy.signum();
+                let excess = coverage[l * m + j] - target;
+                force_x += -2.0 * excess * scale * derivative_x * theta_y;
+                force_y += -2.0 * excess * scale * theta_x * derivative_y;
+            }
+            gradient[index] = (force_x, force_y);
+        }
+        let max_force = gradient
+            .iter()
+            .zip(frozen)
+            .filter(|(_, is_frozen)| !**is_frozen)
+            .map(|(force, _)| force.0.abs().max(force.1.abs()))
+            .fold(0.0_f64, f64::max);
+        if max_force > 1.0e-12 {
+            for (force, is_frozen) in gradient.iter_mut().zip(frozen) {
+                if !*is_frozen {
+                    force.0 /= max_force;
+                    force.1 /= max_force;
+                }
+            }
+        }
+        gradient
+    }
+
+    fn kernel_support(
+        &self,
+        position: (f64, f64),
+        size: (f64, f64),
+    ) -> (Vec<(usize, usize, f64, f64)>, f64) {
+        let m = self.m;
+        let (width, height) = size;
+        let cx = (position.0 - self.min_x) / self.bin_w - 0.5;
+        let cy = (position.1 - self.min_y) / self.bin_h - 0.5;
+        let kernel_w = width.max(self.bin_w);
+        let kernel_h = height.max(self.bin_h);
+        let span_x = (kernel_w / self.bin_w).ceil() as i64 + 1;
+        let span_y = (kernel_h / self.bin_h).ceil() as i64 + 1;
+        let mut support = Vec::new();
+        let mut norm = 0.0;
+        for dx in -span_x..=span_x {
+            for dy in -span_y..=span_y {
+                let l = cx.round() as i64 + dx;
+                let j = cy.round() as i64 + dy;
+                if l < 0 || j < 0 || l >= m as i64 || j >= m as i64 {
+                    continue;
+                }
+                let theta_x = kernel((l as f64 + 0.5 - cx).abs() * self.bin_w, kernel_w);
+                let theta_y = kernel((j as f64 + 0.5 - cy).abs() * self.bin_h, kernel_h);
+                let weight = theta_x * theta_y;
+                if weight > 0.0 {
+                    support.push((l as usize, j as usize, theta_x, theta_y));
+                    norm += weight;
+                }
+            }
+        }
+        (support, norm)
+    }
+
     fn sample(&self, grid_x: &[f64], grid_y: &[f64], position: (f64, f64)) -> (f64, f64) {
         let m = self.m;
         let x = (position.0 - self.min_x) / self.bin_w - 0.5;
@@ -622,6 +733,17 @@ impl DensityGrid {
             a * (1.0 - ty) + b * ty
         };
         (lerp(grid_x), lerp(grid_y))
+    }
+}
+
+fn kernel_derivative(distance: f64, width: f64) -> f64 {
+    let width = width.max(1.0e-9);
+    if distance <= width / 2.0 {
+        -4.0 * distance / (width * width)
+    } else if distance <= width {
+        4.0 * (distance - width) / (width * width)
+    } else {
+        0.0
     }
 }
 
