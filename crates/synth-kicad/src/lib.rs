@@ -70,7 +70,7 @@ pub use erc_validate::{
 };
 pub use export::{
     ExportError, ExportResult, SchematicExportResult, Sidecars, export, export_for_design,
-    export_schematic_only, export_with_placement, export_with_sidecar,
+    export_pcb_only, export_schematic_only, export_with_placement, export_with_sidecar,
     export_with_sidecar_and_routing_order, export_with_sidecars,
     export_with_sidecars_and_routing_order, export_with_sidecars_default, placement_candidates,
     placement_for_export, repacked_placement_candidates,
