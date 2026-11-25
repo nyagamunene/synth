@@ -4372,7 +4372,6 @@ mod tests {
         assert!(setup.contains("(solder_mask_min_width 0.1)"), "{setup}");
     }
 
-    #[test]
     /// An HDI board must be judged against the microvia floor it bought, not
     /// the 0.127 mm standard floor. The setup values are what `kicad-cli`
     /// applies, so they have to move with the profile.
